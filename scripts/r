@@ -1,0 +1,10 @@
+#!/bin/zsh
+# usage: [LANE=name] scripts/r <cmd...>   sync this repo to 512S2:~/science/src-<lane>, run <cmd> there in ~/science/.venv.
+if [ -z "${ZSH_VERSION:-}" ]; then echo "scripts/r must run under zsh; refusing" >&2; exit 2; fi
+set -e
+root=${0:A:h:h}
+[[ -n $root && -f $root/docs/OBJECTIVES.md && -d $root/vendor/mlx_lm ]] || { echo "bad repo root '$root'; refusing" >&2; exit 2; }
+lane=${LANE:-main}
+sshc=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostName=100.123.125.48 -o HostKeyAlias=512s2.local)
+rsync -a --delete -e "${sshc[*]}" --exclude .git --exclude .claude --exclude '__pycache__' "$root/" "512S2:science/src-$lane/"
+"${sshc[@]}" 512S2 "cd ~/science/src-$lane && export PYTHONPATH=\$PWD/vendor:\$PWD HF_HUB_OFFLINE=1 PATH=~/science/.venv/bin:\$PATH && $*"
