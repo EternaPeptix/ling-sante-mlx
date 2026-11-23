@@ -12,3 +12,8 @@ Run order once ~/science/dl.log has DONE (all via LANE=port scripts/r):
  python tools/verify_convert.py <src> <dst> 24
  python tools/test_layers.py <src> <dst> 0,4,7,10 48 [--fp32 --refbf16]
  python tools/run_eval.py gen|ppl|bench <dst> [--long]
+
+## Real-weight layer tests (layers 0,1,4,7; 48 real tokens; converted bf16 dir vs independent fp32 reference)
+fp32 compute, bf16-rounded reference weights, full-layer relL2: L0 3.8e-6, L1 1.2e-5, L4 8.3e-5, L7 2.3e-6; MoE block 1.4e-6/1.5e-6; router top-k agreement 1.000; cache path identical.
+bf16 compute vs true fp32: L0 4.7e-3, L1 7.5e-3, L4 1.2e-1 (2/48 tokens flip a router expert), L7 2.8e-2.
+Experts: 48 sampled bit-identical. Nibble order confirmed only self-consistently; generation sanity pending.

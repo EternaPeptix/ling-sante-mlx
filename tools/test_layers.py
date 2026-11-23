@@ -46,7 +46,7 @@ model.load_weights(list(w.items()), strict=False)
 FP32 = "--fp32" in sys.argv
 if FP32:
     model.set_dtype(mx.float32)
-mx.eval(model.parameters())
+mx.eval([model.model.layers[L].parameters() for L in layers])
 
 if text_file:
     from mlx_lm.utils import load_tokenizer
