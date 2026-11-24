@@ -10,13 +10,14 @@ sys.path[:0] = [str(_root / "vendor"), str(_root)]
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
 from mlx_lm.models.bailing_moe_v3 import Model, ModelArgs  # noqa: E402
+from mlx_lm.models.bailing_moe_v3.fp8 import attach_lingsante_fp8  # noqa: E402
 from mlx_lm.utils import infer_quant_config, load_config  # noqa: E402
 
 DEFAULT_MODEL = os.path.expanduser("~/science/models/lingsante-mlx-mxfp4-bf16")
 DEFAULT_VISITS = os.path.expanduser("~/science/runs/visits")
 
 
-def load_layer(layer_idx: int, model_dir: str = DEFAULT_MODEL):
+def load_layer(layer_idx: int, model_dir: str = DEFAULT_MODEL, *, use_fp8: bool | None = None):
     """Instantiate a minimal model shell and load ONLY weights for layer `layer_idx` (~4.7 GB, <1s)."""
     model_path = Path(model_dir)
     cfg = load_config(model_path)
@@ -33,6 +34,9 @@ def load_layer(layer_idx: int, model_dir: str = DEFAULT_MODEL):
         return infer_quant_config(p, m, w)
 
     nn.quantize(model, group_size=32, bits=4, mode="mxfp4", class_predicate=pred)
+    want_fp8 = (os.environ.get("LINGSANTE_FP8", "1") not in ("0", "")) if use_fp8 is None else bool(use_fp8)
+    if want_fp8:
+        attach_lingsante_fp8(model, w, model_path, layer_indices={layer_idx})
     model.load_weights(list(w.items()), strict=False)
     model.eval()
     layer = model.model.layers[layer_idx]

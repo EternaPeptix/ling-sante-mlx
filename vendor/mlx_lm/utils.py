@@ -610,6 +610,10 @@ def load_model(
         model.update_modules(leaves)
 
     model.eval()
+    if "bailing_moe_v3" in type(model).__module__:
+        from .models.bailing_moe_v3.fp8 import attach_lingsante_fp8
+
+        attach_lingsante_fp8(model, weights, model_path)
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:

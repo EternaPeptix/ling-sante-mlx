@@ -5,7 +5,7 @@ import mlx.core as mx
 
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 
-from .rows.gemv import gemv_rows, gemv_rows_multi, gemv_rows_res, gemv_swiglu_rows
+from .rows.gemv_fp8 import gemv_lin, gemv_lin_multi, gemv_lin_res, gemv_lin_swiglu
 from .rows.kda import kda_gdn_norm_gate_rows, kda_pre_rows
 from .rows.mla import mla_layer_rows
 from .rows.moe import moe_down_combine_rows, moe_gate_up_swiglu_rows
@@ -71,15 +71,15 @@ def fast_decode_forward(model, inputs, cache):
         h_in = mx.fast.rms_norm(x, layer.input_layernorm.weight, layer.input_layernorm.eps)
         if layer.is_linear:
             attn = layer.attention
-            q_r, k_r, v_r, f_r, g_r, b_r = gemv_rows_multi(
+            q_r, k_r, v_r, f_r, g_r, b_r = gemv_lin_multi(
                 h_in,
                 [
-                    attn.q_proj.weight,
-                    attn.k_proj.weight,
-                    attn.v_proj.weight,
-                    attn.f_proj.weight,
-                    attn.g_proj.weight,
-                    attn.b_proj.weight,
+                    attn.q_proj,
+                    attn.k_proj,
+                    attn.v_proj,
+                    attn.f_proj,
+                    attn.g_proj,
+                    attn.b_proj,
                 ],
             )
             q, k, v, g, beta, ns0, ns1, ns2 = kda_pre_rows(
@@ -116,7 +116,7 @@ def fast_decode_forward(model, inputs, cache):
             c[2] = ns2
             c[3] = ns3
             c.advance(1)
-            h_post = gemv_rows_res(ov, attn.o_proj.weight, x)
+            h_post = gemv_lin_res(ov, attn.o_proj, x)
         else:
             h_post = mla_layer_rows(h_in, x, layer.attention, c)
 
@@ -138,9 +138,9 @@ def fast_decode_forward(model, inputs, cache):
                 routed_scaling_factor=gate.routed_scaling_factor,
             )
             se = mlp.shared_experts
-            sh = gemv_rows(
-                gemv_swiglu_rows(mlp_in, se.gate_proj.weight, se.up_proj.weight),
-                se.down_proj.weight,
+            sh = gemv_lin(
+                gemv_lin_swiglu(mlp_in, se.gate_proj, se.up_proj),
+                se.down_proj,
             )
             sw = mlp.switch_mlp
             h_mid = moe_gate_up_swiglu_rows(
@@ -161,8 +161,8 @@ def fast_decode_forward(model, inputs, cache):
                 residual=h_post,
             )
         else:
-            mid = gemv_swiglu_rows(mlp_in, mlp.gate_proj.weight, mlp.up_proj.weight)
-            x = gemv_rows_res(mid, mlp.down_proj.weight, h_post)
+            mid = gemv_lin_swiglu(mlp_in, mlp.gate_proj, mlp.up_proj)
+            x = gemv_lin_res(mid, mlp.down_proj, h_post)
 
     x = mx.fast.rms_norm(x, inner.norm.weight, inner.norm.eps)
-    return gemv_rows(x, model.lm_head.weight)[:, None, :]
+    return gemv_lin(x, model.lm_head)[:, None, :]

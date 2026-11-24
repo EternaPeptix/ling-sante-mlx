@@ -6,7 +6,7 @@ import mlx.core as mx
 
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 
-from .rows.gemv import gemv_rows, gemv_rows_multi, gemv_rows_res, gemv_swiglu_rows
+from .rows.gemv_fp8 import gemv_lin, gemv_lin_multi, gemv_lin_res, gemv_lin_swiglu
 from .rows.kda import (
     kda_gdn_advance_only,
     kda_gdn_advance_split_only,
@@ -112,6 +112,7 @@ def fast_verify_forward(
     moe_gu_tmax: int | None = None,
     moe_dc_tmax: int | None = None,
     moe_dc_nsg: int | None = None,
+    capture_layers: tuple[int, ...] | None = None,
 ):
     """Run bit-exact multi-token verification forward for `(C, L)` with `C * L <= 24`.
 
@@ -126,20 +127,22 @@ def fast_verify_forward(
     kda_records = []
     mla_caches = []
     use_dedup = C * L >= 5
+    cap_set = set(capture_layers) if capture_layers else None
+    captured = {}
 
     for li, (layer, c) in enumerate(zip(inner.layers, cache)):
         h_in = mx.fast.rms_norm(x, layer.input_layernorm.weight, layer.input_layernorm.eps)
         if layer.is_linear:
             attn = layer.attention
-            q_r, k_r, v_r, f_r, g_r, b_r = gemv_rows_multi(
+            q_r, k_r, v_r, f_r, g_r, b_r = gemv_lin_multi(
                 h_in,
                 [
-                    attn.q_proj.weight,
-                    attn.k_proj.weight,
-                    attn.v_proj.weight,
-                    attn.f_proj.weight,
-                    attn.g_proj.weight,
-                    attn.b_proj.weight,
+                    attn.q_proj,
+                    attn.k_proj,
+                    attn.v_proj,
+                    attn.f_proj,
+                    attn.g_proj,
+                    attn.b_proj,
                 ],
             )
             q, k, v, g, beta, h0, h1, h2 = kda_pre_seq_rows(
@@ -173,7 +176,7 @@ def fast_verify_forward(
                 )
             if return_rollback:
                 kda_records.append((c, s0, s_end, k, v, g, beta, h0, h1, h2))
-            h_post = gemv_rows_res(ov, attn.o_proj.weight, x)
+            h_post = gemv_lin_res(ov, attn.o_proj, x)
         else:
             h_post = mla_verify_layer_rows(h_in, x, layer.attention, c, C=C, L=L)
             if return_rollback:
@@ -197,9 +200,9 @@ def fast_verify_forward(
                 routed_scaling_factor=gate.routed_scaling_factor,
             )
             se = mlp.shared_experts
-            sh = gemv_rows(
-                gemv_swiglu_rows(mlp_in, se.gate_proj.weight, se.up_proj.weight),
-                se.down_proj.weight,
+            sh = gemv_lin(
+                gemv_lin_swiglu(mlp_in, se.gate_proj, se.up_proj),
+                se.down_proj,
             )
             sw = mlp.switch_mlp
             dedup = moe_dedup_rows(inds) if use_dedup else None
@@ -226,16 +229,24 @@ def fast_verify_forward(
                 dedup=dedup,
             )
         else:
-            mid = gemv_swiglu_rows(mlp_in, mlp.gate_proj.weight, mlp.up_proj.weight)
-            x = gemv_rows_res(mid, mlp.down_proj.weight, h_post)
+            mid = gemv_lin_swiglu(mlp_in, mlp.gate_proj, mlp.up_proj)
+            x = gemv_lin_res(mid, mlp.down_proj, h_post)
+
+        if cap_set is not None and li in cap_set:
+            captured[li] = x
 
         if _VERIFY_FLUSH_EVERY > 0 and (li + 1) % _VERIFY_FLUSH_EVERY == 0:
             mx.async_eval(x)
 
     hidden = mx.fast.rms_norm(x, inner.norm.weight, inner.norm.eps)
-    logits = gemv_rows(hidden, model.lm_head.weight).reshape(C, L, -1)
+    logits = gemv_lin(hidden, model.lm_head).reshape(C, L, -1)
 
-    rb = {"C": C, "L": L, "kda": kda_records, "mla": mla_caches} if return_rollback else None
+    if return_rollback:
+        rb = {"C": C, "L": L, "kda": kda_records, "mla": mla_caches}
+        if capture_layers:
+            rb["captured"] = mx.concatenate([captured[li] for li in capture_layers], axis=-1).reshape(C, L, -1)
+    else:
+        rb = None
     if return_hidden and return_rollback:
         return logits, hidden.reshape(C, L, -1), rb
     if return_hidden:

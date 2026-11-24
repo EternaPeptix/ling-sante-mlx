@@ -11,6 +11,7 @@ import math
 import mlx.core as mx
 
 from .gemv import gemv_rows, gemv_rows_multi, gemv_rows_res
+from .gemv_fp8 import E4M3_LUT_METAL, gemv_lin, gemv_lin_multi, gemv_lin_res
 from .glue import GLUE_HEADER, flit
 
 _KERNELS = {}
@@ -94,21 +95,24 @@ _ML_SRC = r"""
     constexpr int blockN = 32 * TN;  // 128
 
     const uint lane = thread_index_in_simdgroup;
-    const uint sg = simdgroup_index_in_threadgroup;
+    const uint sg_all = simdgroup_index_in_threadgroup;
+    const int sg = int(sg_all) / BSG;
+    const int b_sg = int(sg_all) % BSG;
+    const int b0 = b_sg * B_SUB;
     const uint tgx = threadgroup_position_in_grid.x;
     const uint h = threadgroup_position_in_grid.z;
 
-    const int out_row = int(tgx) * blockM + int(sg) * TM;
+    const int out_row = int(tgx) * blockM + sg * TM;
     if (out_row >= NN) return;
 
     const device T* mat = w + size_t(h) * NN * KK + size_t(out_row) * KK;
     int bn = int(lane) * TN;
-    float res[BB][TM];
+    float res[B_SUB][TM];
 #pragma unroll
-    for (int b = 0; b < BB; ++b)
+    for (int bi = 0; bi < B_SUB; ++bi)
 #pragma unroll
       for (int tm = 0; tm < TM; ++tm)
-        res[b][tm] = 0.0f;
+        res[bi][tm] = 0.0f;
 
     constexpr int n_iter = KK / blockN;
     for (int i = 0; i < n_iter; ++i) {
@@ -120,36 +124,123 @@ _ML_SRC = r"""
         for (int tn = 0; tn < 4; ++tn) inter[tm][tn] = as_type<bfloat16_t>(pw[tn]);
       }
 #pragma unroll
-      for (int b = 0; b < BB; ++b) {
-        float vc[TN];
-        const device ushort* px = (const device ushort*)(x + (size_t(b) * NH + h) * KK + bn);
+      for (int bi = 0; bi < B_SUB; ++bi) {
+        const int b = b0 + bi;
+        if (b < BB) {
+          float vc[TN];
+          const device ushort* px = (const device ushort*)(x + (size_t(b) * NH + h) * KK + bn);
 #pragma unroll
-        for (int tn = 0; tn < 4; ++tn) vc[tn] = static_cast<float>(as_type<bfloat16_t>(px[tn]));
+          for (int tn = 0; tn < 4; ++tn) vc[tn] = static_cast<float>(as_type<bfloat16_t>(px[tn]));
 #pragma unroll
-        for (int tm = 0; tm < TM; ++tm)
+          for (int tm = 0; tm < TM; ++tm)
 #pragma unroll
-          for (int tn = 0; tn < 4; ++tn)
-            res[b][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
+            for (int tn = 0; tn < 4; ++tn)
+              res[bi][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
+        }
       }
       bn += blockN;
     }
 
 #pragma unroll
-    for (int b = 0; b < BB; ++b) {
-      T gate = static_cast<T>(1.0f);
-      if constexpr (HAS_GATE) {
-        gate = static_cast<T>(glue_sigmoid(static_cast<float>(g_raw[size_t(b) * NH + h])));
+    for (int bi = 0; bi < B_SUB; ++bi) {
+      const int b = b0 + bi;
+      if (b < BB) {
+        T gate = static_cast<T>(1.0f);
+        if constexpr (HAS_GATE) {
+          gate = static_cast<T>(glue_sigmoid(static_cast<float>(g_raw[size_t(b) * NH + h])));
+        }
+#pragma unroll
+        for (int tm = 0; tm < TM; ++tm) {
+#pragma unroll
+          for (ushort sn = 16; sn >= 1; sn >>= 1) {
+            res[bi][tm] += simd_shuffle_down(res[bi][tm], sn);
+          }
+          if (lane == 0) {
+            T v = static_cast<T>(res[bi][tm]);
+            if constexpr (HAS_GATE) v = v * gate;
+            out[(size_t(b) * NH + h) * NN + out_row + tm] = v;
+          }
+        }
       }
+    }
+"""
+
+_ML_FP8_SRC = r"""
+    constexpr int BM = 4;
+    constexpr int TN = 4;
+    constexpr int blockM = BM * TM;
+    constexpr int blockN = 32 * TN;  // 128
+
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg_all = simdgroup_index_in_threadgroup;
+    const int sg = int(sg_all) / BSG;
+    const int b_sg = int(sg_all) % BSG;
+    const int b0 = b_sg * B_SUB;
+    const uint tgx = threadgroup_position_in_grid.x;
+    const uint h = threadgroup_position_in_grid.z;
+
+    const int out_row = int(tgx) * blockM + sg * TM;
+    if (out_row >= NN) return;
+
+    const device uchar* mat = w + size_t(h) * NN * KK + size_t(out_row) * KK;
+    const device float* sc_h = sc_inv + size_t(h) * 4;
+    int bn = int(lane) * TN;
+    float res[B_SUB][TM];
+#pragma unroll
+    for (int bi = 0; bi < B_SUB; ++bi)
+#pragma unroll
+      for (int tm = 0; tm < TM; ++tm)
+        res[bi][tm] = 0.0f;
+
+    constexpr int n_iter = KK / blockN;
+    for (int i = 0; i < n_iter; ++i) {
+      const float sc = SCALE_BY_N ? sc_h[out_row >> 7] : sc_h[i];
+      float wf[TM][4];
 #pragma unroll
       for (int tm = 0; tm < TM; ++tm) {
+        const uchar4 pk = *(const device uchar4*)(mat + size_t(tm) * KK + bn);
+        wf[tm][0] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.x] * sc));
+        wf[tm][1] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.y] * sc));
+        wf[tm][2] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.z] * sc));
+        wf[tm][3] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.w] * sc));
+      }
 #pragma unroll
-        for (ushort sn = 16; sn >= 1; sn >>= 1) {
-          res[b][tm] += simd_shuffle_down(res[b][tm], sn);
+      for (int bi = 0; bi < B_SUB; ++bi) {
+        const int b = b0 + bi;
+        if (b < BB) {
+          float vc[TN];
+          const device ushort* px = (const device ushort*)(x + (size_t(b) * NH + h) * KK + bn);
+#pragma unroll
+          for (int tn = 0; tn < 4; ++tn) vc[tn] = static_cast<float>(as_type<bfloat16_t>(px[tn]));
+#pragma unroll
+          for (int tm = 0; tm < TM; ++tm)
+#pragma unroll
+            for (int tn = 0; tn < 4; ++tn)
+              res[bi][tm] += wf[tm][tn] * vc[tn];
         }
-        if (lane == 0) {
-          T v = static_cast<T>(res[b][tm]);
-          if constexpr (HAS_GATE) v = v * gate;
-          out[(size_t(b) * NH + h) * NN + out_row + tm] = v;
+      }
+      bn += blockN;
+    }
+
+#pragma unroll
+    for (int bi = 0; bi < B_SUB; ++bi) {
+      const int b = b0 + bi;
+      if (b < BB) {
+        T gate = static_cast<T>(1.0f);
+        if constexpr (HAS_GATE) {
+          gate = static_cast<T>(glue_sigmoid(static_cast<float>(g_raw[size_t(b) * NH + h])));
+        }
+#pragma unroll
+        for (int tm = 0; tm < TM; ++tm) {
+#pragma unroll
+          for (ushort sn = 16; sn >= 1; sn >>= 1) {
+            res[bi][tm] += simd_shuffle_down(res[bi][tm], sn);
+          }
+          if (lane == 0) {
+            T v = static_cast<T>(res[bi][tm]);
+            if constexpr (HAS_GATE) v = v * gate;
+            out[(size_t(b) * NH + h) * NN + out_row + tm] = v;
+          }
         }
       }
     }
@@ -204,6 +295,30 @@ def _ml_kernel():
     return k
 
 
+def _ml_fp8_kernel():
+    k = _KERNELS.get("ml_fp8")
+    if k is None:
+        k = _KERNELS["ml_fp8"] = mx.fast.metal_kernel(
+            name="bv3_mla_multilinear_fp8",
+            input_names=["x", "w", "sc_inv", "g_raw"],
+            output_names=["out"],
+            header=GLUE_HEADER + "\n" + E4M3_LUT_METAL,
+            source=_ML_FP8_SRC,
+            ensure_row_contiguous=True,
+        )
+    return k
+
+
+def _ml_cfg(B: int):
+    if B <= 4:
+        return 1, B, 4
+    if B <= 8:
+        return 1, B, 2
+    if B <= 16:
+        return 2, (B + 1) // 2, 2
+    return 3, (B + 2) // 3, 2
+
+
 def mla_multilinear_rows(x: mx.array, w: mx.array, g_raw: mx.array | None = None) -> mx.array:
     """Weights-read-once MultiLinear for (B, H, 1, K) @ (H, N, K).T, optional fused head gate."""
     B, H, L, K = x.shape
@@ -211,17 +326,68 @@ def mla_multilinear_rows(x: mx.array, w: mx.array, g_raw: mx.array | None = None
     assert L == 1 and 1 <= B <= 24 and w.shape == (H, N, K) and K % 128 == 0 and N % 8 == 0
     has_gate = g_raw is not None
     gr = g_raw if has_gate else mx.zeros((1,), dtype=x.dtype)
-    tm = 4 if B <= 12 else 2
+    bsg, b_sub, tm = _ml_cfg(B)
     nt = N // (4 * tm)
     (out,) = _ml_kernel()(
         inputs=[x, w, gr],
-        template=[("T", x.dtype), ("BB", B), ("NH", H), ("NN", N), ("KK", K), ("TM", tm), ("HAS_GATE", int(has_gate))],
-        grid=(nt * 32, 4, H),
-        threadgroup=(32, 4, 1),
+        template=[
+            ("T", x.dtype),
+            ("BB", B),
+            ("BSG", bsg),
+            ("B_SUB", b_sub),
+            ("NH", H),
+            ("NN", N),
+            ("KK", K),
+            ("TM", tm),
+            ("HAS_GATE", int(has_gate)),
+        ],
+        grid=(nt * 32, 4 * bsg, H),
+        threadgroup=(32, 4 * bsg, 1),
         output_shapes=[(B, N * H) if has_gate else (B, H, 1, N)],
         output_dtypes=[x.dtype],
     )
     return out
+
+
+def mla_multilinear_fp8_rows(
+    x: mx.array, w_fp8: mx.array, w_sc: mx.array, *, scale_by_n: bool, g_raw: mx.array | None = None
+) -> mx.array:
+    """Bit-exact FP8 MultiLinear reading uint8 weights + float32 scale_inv directly."""
+    B, H, L, K = x.shape
+    N = w_fp8.shape[1]
+    assert L == 1 and 1 <= B <= 24 and w_fp8.shape == (H, N, K) and K % 128 == 0 and N % 8 == 0
+    has_gate = g_raw is not None
+    gr = g_raw if has_gate else mx.zeros((1,), dtype=x.dtype)
+    bsg, b_sub, tm = _ml_cfg(B)
+    nt = N // (4 * tm)
+    (out,) = _ml_fp8_kernel()(
+        inputs=[x, w_fp8, w_sc, gr],
+        template=[
+            ("T", x.dtype),
+            ("BB", B),
+            ("BSG", bsg),
+            ("B_SUB", b_sub),
+            ("NH", H),
+            ("NN", N),
+            ("KK", K),
+            ("TM", tm),
+            ("SCALE_BY_N", int(bool(scale_by_n))),
+            ("HAS_GATE", int(has_gate)),
+        ],
+        grid=(nt * 32, 4 * bsg, H),
+        threadgroup=(32, 4 * bsg, 1),
+        output_shapes=[(B, N * H) if has_gate else (B, H, 1, N)],
+        output_dtypes=[x.dtype],
+    )
+    return out
+
+
+def mla_multilinear_lin(x: mx.array, mod, g_raw: mx.array | None = None) -> mx.array:
+    if hasattr(mod, "weight_fp8"):
+        return mla_multilinear_fp8_rows(
+            x, mod.weight_fp8, mod.weight_scale_inv, scale_by_n=mod.scale_by_n, g_raw=g_raw
+        )
+    return mla_multilinear_rows(x, mod.weight, g_raw=g_raw)
 
 
 def mla_prep_kv_rope_rows(
@@ -318,11 +484,11 @@ def mla_sdpa_rows(q_nope: mx.array, q_rope: mx.array, kv_latent_all: mx.array, k
 def mla_layer_rows(h_in: mx.array, res: mx.array, attn, cache):
     """Full fused single-token (B <= 4) BailingMLA layer with residual add -> h_post (B, 4096)."""
     B = h_in.shape[0]
-    q_a, kv_a_full, g_raw = gemv_rows_multi(
-        h_in, [attn.q_a_proj.weight, attn.kv_a_proj_with_mqa.weight, attn.g_proj.weight]
+    q_a, kv_a_full, g_raw = gemv_lin_multi(
+        h_in, [attn.q_a_proj, attn.kv_a_proj_with_mqa, attn.g_proj]
     )
     q_a_norm = mx.fast.rms_norm(q_a, attn.q_a_layernorm.weight, attn.q_a_layernorm.eps)
-    q_full = gemv_rows(q_a_norm, attn.q_b_proj.weight)
+    q_full = gemv_lin(q_a_norm, attn.q_b_proj)
     q_nope, q_rope, kv_latent, k_rope = mla_prep_kv_rope_rows(
         q_full,
         kv_a_full,
@@ -332,20 +498,20 @@ def mla_layer_rows(h_in: mx.array, res: mx.array, attn, cache):
         base=float(getattr(attn.rope, "base", 6000000.0)),
         scale=float(getattr(attn.rope, "scale", 1.0)),
     )
-    q_nope = mla_multilinear_rows(q_nope, attn.embed_q.weight)
+    q_nope = mla_multilinear_lin(q_nope, attn.embed_q)
     kl_all, kr_all = cache.update_and_fetch(kv_latent, k_rope)
     starts = _get_left_starts(cache, B)
     out = mla_sdpa_rows(q_nope, q_rope, kl_all, kr_all, attn.scale, starts)
-    gated = mla_multilinear_rows(out, attn.unembed_out.weight, g_raw=g_raw)
-    return gemv_rows_res(gated, attn.dense.weight, res)
+    gated = mla_multilinear_lin(out, attn.unembed_out, g_raw=g_raw)
+    return gemv_lin_res(gated, attn.dense, res)
 
 
 def _mla_verify_proj_prep(h_in: mx.array, attn, offsets: mx.array):
-    q_a, kv_a_full, g_raw = gemv_rows_multi(
-        h_in, [attn.q_a_proj.weight, attn.kv_a_proj_with_mqa.weight, attn.g_proj.weight]
+    q_a, kv_a_full, g_raw = gemv_lin_multi(
+        h_in, [attn.q_a_proj, attn.kv_a_proj_with_mqa, attn.g_proj]
     )
     q_a_norm = mx.fast.rms_norm(q_a, attn.q_a_layernorm.weight, attn.q_a_layernorm.eps)
-    q_full = gemv_rows(q_a_norm, attn.q_b_proj.weight)
+    q_full = gemv_lin(q_a_norm, attn.q_b_proj)
     q_nope, q_rope, kv_latent, k_rope = mla_prep_kv_rope_rows(
         q_full,
         kv_a_full,
@@ -355,7 +521,7 @@ def _mla_verify_proj_prep(h_in: mx.array, attn, offsets: mx.array):
         base=float(getattr(attn.rope, "base", 6000000.0)),
         scale=float(getattr(attn.rope, "scale", 1.0)),
     )
-    q_nope = mla_multilinear_rows(q_nope, attn.embed_q.weight)
+    q_nope = mla_multilinear_lin(q_nope, attn.embed_q)
     return q_nope, q_rope, kv_latent, k_rope, g_raw
 
 
@@ -432,8 +598,8 @@ def mla_verify_layer_rows(h_in: mx.array, res: mx.array, attn, cache, *, C: int,
         _mla_append_causal_slice(outs, kl_all, kr_all, q_nope, q_rope, 0, 0, off0, L, scale)
 
     out = mx.concatenate(outs, axis=0)
-    gated = mla_multilinear_rows(out, attn.unembed_out.weight, g_raw=g_raw)
-    return gemv_rows_res(gated, attn.dense.weight, res)
+    gated = mla_multilinear_lin(out, attn.unembed_out, g_raw=g_raw)
+    return gemv_lin_res(gated, attn.dense, res)
 
 
 def mla_verify_varlen_rows(h_in: mx.array, res: mx.array, attn, caches: list, Ls: list[int]):
@@ -459,5 +625,5 @@ def mla_verify_varlen_rows(h_in: mx.array, res: mx.array, attn, caches: list, Ls
         pos += lc
 
     out = mx.concatenate(outs, axis=0)
-    gated = mla_multilinear_rows(out, attn.unembed_out.weight, g_raw=g_raw)
-    return gemv_rows_res(gated, attn.dense.weight, res)
+    gated = mla_multilinear_lin(out, attn.unembed_out, g_raw=g_raw)
+    return gemv_lin_res(gated, attn.dense, res)

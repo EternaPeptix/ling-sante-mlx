@@ -24,7 +24,7 @@ _HEADER = (
     + r"""
 struct Bf4 { ushort v[4]; };
 
-template <typename T, typename WT, typename XT, int B, int BM, int BN, int SM, int SN, int TM, int TN, int RES, int SWIGLU, int KK>
+template <typename T, typename WT, typename XT, int B, int BSG, int B_SUB, int BM, int BN, int SM, int SN, int TM, int TN, int RES, int SWIGLU, int KK>
 METAL_FUNC void bailing_gemv_rows_run(
     const device WT* mat,
     const device WT* mat_up,
@@ -41,21 +41,23 @@ METAL_FUNC void bailing_gemv_rows_run(
   constexpr int blockM = threadsM * TM;
   constexpr int blockN = threadsN * TN;
 
-  float result[B][TM];
-  float result_up[SWIGLU ? B : 1][SWIGLU ? TM : 1];
+  float result[B_SUB][TM];
+  float result_up[SWIGLU ? B_SUB : 1][SWIGLU ? TM : 1];
 #pragma unroll
-  for (int b = 0; b < B; b++) {
+  for (int bi = 0; bi < B_SUB; bi++) {
 #pragma unroll
     for (int tm = 0; tm < TM; tm++) {
-      result[b][tm] = 0.0f;
-      if constexpr (SWIGLU) result_up[b][tm] = 0.0f;
+      result[bi][tm] = 0.0f;
+      if constexpr (SWIGLU) result_up[bi][tm] = 0.0f;
     }
   }
 
   const int thrM = SN != 32 ? int(simd_lid) / SN : 0;
   const int thrN = SN != 32 ? int(simd_lid) % SN : int(simd_lid);
   const int sgN = BN != 1 ? int(simd_gid % BN) : 0;
-  const int simdM = BN != 1 ? SM * int(simd_gid / BN) : int(SM * simd_gid);
+  const int b_sg = (BN == 1 && BSG > 1) ? int(simd_gid % BSG) : 0;
+  const int b0 = b_sg * B_SUB;
+  const int simdM = (BN != 1) ? SM * int(simd_gid / BN) : (BSG > 1 ? SM * int(simd_gid / BSG) : int(SM * simd_gid));
   const int simdN = BN != 1 ? SN * int(simd_gid % BN) : 0;
   int bm = (simdM + thrM) * TM;
   int bn = (simdN + thrN) * TN;
@@ -96,23 +98,26 @@ METAL_FUNC void bailing_gemv_rows_run(
       }
     }
 #pragma unroll
-    for (int b = 0; b < B; b++) {
-      float vc[TN];
-      if constexpr (TN == 4 && sizeof(XT) == 2) {
-        Bf4 px = *(const device Bf4*)(in_vec + b * KK + bn);
+    for (int bi = 0; bi < B_SUB; bi++) {
+      const int b = b0 + bi;
+      if (b < B) {
+        float vc[TN];
+        if constexpr (TN == 4 && sizeof(XT) == 2) {
+          Bf4 px = *(const device Bf4*)(in_vec + size_t(b) * KK + bn);
 #pragma unroll
-        for (int tn = 0; tn < 4; tn++) vc[tn] = static_cast<float>(as_type<bfloat16_t>(px.v[tn]));
-      } else {
+          for (int tn = 0; tn < 4; tn++) vc[tn] = static_cast<float>(as_type<bfloat16_t>(px.v[tn]));
+        } else {
 #pragma unroll
-        for (int tn = 0; tn < TN; tn++) vc[tn] = static_cast<float>(in_vec[b * KK + bn + tn]);
-      }
+          for (int tn = 0; tn < TN; tn++) vc[tn] = static_cast<float>(in_vec[size_t(b) * KK + bn + tn]);
+        }
 #pragma unroll
-      for (int tm = 0; tm < TM; tm++) {
+        for (int tm = 0; tm < TM; tm++) {
 #pragma unroll
-        for (int tn = 0; tn < TN; tn++) {
-          result[b][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
-          if constexpr (SWIGLU) {
-            result_up[b][tm] += static_cast<float>(inter_up[tm][tn]) * vc[tn];
+          for (int tn = 0; tn < TN; tn++) {
+            result[bi][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
+            if constexpr (SWIGLU) {
+              result_up[bi][tm] += static_cast<float>(inter_up[tm][tn]) * vc[tn];
+            }
           }
         }
       }
@@ -134,19 +139,22 @@ METAL_FUNC void bailing_gemv_rows_run(
       }
     }
 #pragma unroll
-    for (int b = 0; b < B; b++) {
-      float vc[TN];
-#pragma unroll
-      for (int tn = 0; tn < TN; tn++) {
-        vc[tn] = (bn + tn < KK) ? static_cast<float>(in_vec[b * KK + bn + tn]) : 0.0f;
-      }
-#pragma unroll
-      for (int tm = 0; tm < TM; tm++) {
+    for (int bi = 0; bi < B_SUB; bi++) {
+      const int b = b0 + bi;
+      if (b < B) {
+        float vc[TN];
 #pragma unroll
         for (int tn = 0; tn < TN; tn++) {
-          result[b][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
-          if constexpr (SWIGLU) {
-            result_up[b][tm] += static_cast<float>(inter_up[tm][tn]) * vc[tn];
+          vc[tn] = (bn + tn < KK) ? static_cast<float>(in_vec[size_t(b) * KK + bn + tn]) : 0.0f;
+        }
+#pragma unroll
+        for (int tm = 0; tm < TM; tm++) {
+#pragma unroll
+          for (int tn = 0; tn < TN; tn++) {
+            result[bi][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
+            if constexpr (SWIGLU) {
+              result_up[bi][tm] += static_cast<float>(inter_up[tm][tn]) * vc[tn];
+            }
           }
         }
       }
@@ -154,40 +162,43 @@ METAL_FUNC void bailing_gemv_rows_run(
   }
 
 #pragma unroll
-  for (int b = 0; b < B; b++) {
+  for (int bi = 0; bi < B_SUB; bi++) {
 #pragma unroll
     for (int tm = 0; tm < TM; tm++) {
 #pragma unroll
       for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
-        result[b][tm] += simd_shuffle_down(result[b][tm], sn);
-        if constexpr (SWIGLU) result_up[b][tm] += simd_shuffle_down(result_up[b][tm], sn);
+        result[bi][tm] += simd_shuffle_down(result[bi][tm], sn);
+        if constexpr (SWIGLU) result_up[bi][tm] += simd_shuffle_down(result_up[bi][tm], sn);
       }
     }
   }
 
   if (BN > 1) {
-    for (int b = 0; b < B; b++) {
-      threadgroup float* tgp_results = tgp_memory + (b * BN + sgN) * (blockM + TM) + bm;
-      if (thrN == 0) {
-        for (int tm = 0; tm < TM; tm++) tgp_results[tm] = result[b][tm];
-        threadgroup_barrier(mem_flags::mem_none);
-        if (sgN == 0) {
-          for (int sgn = 1; sgn < BN; sgn++) {
-            for (int tm = 0; tm < TM; tm++) {
-              result[b][tm] += tgp_results[sgn * (blockM + TM) + tm];
-            }
-          }
-        }
-      }
-      if constexpr (SWIGLU) {
-        threadgroup float* tgp_up = tgp_memory + (B * BN + b * BN + sgN) * (blockM + TM) + bm;
+    for (int bi = 0; bi < B_SUB; bi++) {
+      const int b = b0 + bi;
+      if (b < B) {
+        threadgroup float* tgp_results = tgp_memory + (b * BN + sgN) * (blockM + TM) + bm;
         if (thrN == 0) {
-          for (int tm = 0; tm < TM; tm++) tgp_up[tm] = result_up[b][tm];
+          for (int tm = 0; tm < TM; tm++) tgp_results[tm] = result[bi][tm];
           threadgroup_barrier(mem_flags::mem_none);
           if (sgN == 0) {
             for (int sgn = 1; sgn < BN; sgn++) {
               for (int tm = 0; tm < TM; tm++) {
-                result_up[b][tm] += tgp_up[sgn * (blockM + TM) + tm];
+                result[bi][tm] += tgp_results[sgn * (blockM + TM) + tm];
+              }
+            }
+          }
+        }
+        if constexpr (SWIGLU) {
+          threadgroup float* tgp_up = tgp_memory + (B * BN + b * BN + sgN) * (blockM + TM) + bm;
+          if (thrN == 0) {
+            for (int tm = 0; tm < TM; tm++) tgp_up[tm] = result_up[bi][tm];
+            threadgroup_barrier(mem_flags::mem_none);
+            if (sgN == 0) {
+              for (int sgn = 1; sgn < BN; sgn++) {
+                for (int tm = 0; tm < TM; tm++) {
+                  result_up[bi][tm] += tgp_up[sgn * (blockM + TM) + tm];
+                }
               }
             }
           }
@@ -197,16 +208,20 @@ METAL_FUNC void bailing_gemv_rows_run(
   }
 
   if (simdN == 0 && thrN == 0) {
-    for (int b = 0; b < B; b++) {
-      for (int tm = 0; tm < TM; tm++) {
-        if constexpr (SWIGLU) {
-          bfloat16_t g = static_cast<bfloat16_t>(result[b][tm]);
-          bfloat16_t u = static_cast<bfloat16_t>(result_up[b][tm]);
-          out_vec[b * N + out_row + tm] = glue_swiglu_bf16(g, u);
-        } else if constexpr (RES) {
-          out_vec[b * N + out_row + tm] = static_cast<T>(result[b][tm]) + res_vec[b * N + out_row + tm];
-        } else {
-          out_vec[b * N + out_row + tm] = static_cast<T>(result[b][tm]);
+    for (int bi = 0; bi < B_SUB; bi++) {
+      const int b = b0 + bi;
+      if (b < B) {
+        for (int tm = 0; tm < TM; tm++) {
+          if constexpr (SWIGLU) {
+            bfloat16_t g = static_cast<bfloat16_t>(result[bi][tm]);
+            bfloat16_t u = static_cast<bfloat16_t>(result_up[bi][tm]);
+            out_vec[size_t(b) * N + out_row + tm] = glue_swiglu_bf16(g, u);
+          } else if constexpr (RES) {
+            out_vec[size_t(b) * N + out_row + tm] =
+                static_cast<T>(result[bi][tm]) + res_vec[size_t(b) * N + out_row + tm];
+          } else {
+            out_vec[size_t(b) * N + out_row + tm] = static_cast<T>(result[bi][tm]);
+          }
         }
       }
     }
@@ -217,8 +232,8 @@ METAL_FUNC void bailing_gemv_rows_run(
 
 
 def _cfg(N: int, K: int, B: int = 1, is_swiglu: bool = False):
-    """Exact block config MLX 0.32.4 picks for M == 1, tuned TM/BM per B regime to avoid spills."""
-    tm, tn, sm, sn, bm, bn = 4, 4, 1, 32, 1, 1
+    """Exact block config MLX 0.32.4 picks for M == 1, plus BSG splitting for B >= 13 to avoid spills."""
+    tm, tn, sm, sn, bm, bn, bsg = 4, 4, 1, 32, 1, 1, 1
     bm = (4 if B >= 14 else _GEMV_BM_LARGE) if N >= 4096 else 4
     sn = 32
     if K <= 64:
@@ -231,12 +246,14 @@ def _cfg(N: int, K: int, B: int = 1, is_swiglu: bool = False):
     else:
         if 5 <= B <= 12:
             tm = 2
-        elif 13 <= B <= 16:
-            tm = 1
-        elif B > 16:
-            tm = 2
+        elif B >= 13:
+            if bn == 1 and sm == 1 and sn == 32:
+                bsg = 2 if B <= 16 else 3
+                tm = 2
+            else:
+                tm = 1
     tm = 1 if N < tm else tm
-    return bm, bn, sm, sn, tm, tn
+    return bm, bn, sm, sn, tm, tn, bsg
 
 
 def _tname(dt):
@@ -247,7 +264,8 @@ def _build_group(out_dt, w_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=
     key = (out_dt, w_dt, x_dt, B, G, tuple(Ns), K, cfg, has_res, is_swiglu)
     if key in _KERNELS:
         return _KERNELS[key]
-    bm, bn, sm, sn, tm, tn = cfg
+    bm, bn, sm, sn, tm, tn, bsg = cfg
+    b_sub = (B + bsg - 1) // bsg
     blockM = bm * sm * tm
     tg_floats = (2 if is_swiglu else 1) * B * bn * (blockM + tm) if bn > 1 else 1
     T, WT, XT = _tname(out_dt), _tname(w_dt), _tname(x_dt)
@@ -261,7 +279,7 @@ def _build_group(out_dt, w_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=
         wup = "u0" if is_swiglu else "w0"
         rv = "res" if has_res else "out0"
         lines.append(
-            f"bailing_gemv_rows_run<{T}, {WT}, {XT}, {B}, {bm}, {bn}, {sm}, {sn}, {tm}, {tn}, {int(has_res)}, {int(is_swiglu)}, {K}>"
+            f"bailing_gemv_rows_run<{T}, {WT}, {XT}, {B}, {bsg}, {b_sub}, {bm}, {bn}, {sm}, {sn}, {tm}, {tn}, {int(has_res)}, {int(is_swiglu)}, {K}>"
             f"(w0, {wup}, x0, {rv}, out0, {N0}, tgp_mem, t, "
             f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
         )
@@ -282,7 +300,6 @@ def _build_group(out_dt, w_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=
             kw = "if" if g == 0 else "else if"
             wup_s = f"up_p = u{g}; " if is_swiglu else ""
             rv_s = "rp = res; " if has_res else f"rp = out{g}; "
-            cond = f"({kw == 'if' and 't < ' or 't < '}{start + nt})"
             if g < len(Ns) - 1:
                 lines.append(
                     f"{kw} (t < {start + nt}) {{ wp = w{g}; {wup_s}xp = x{g}; {rv_s}op = out{g}; n_cur = {N}; t_loc = t - {start}; }}"
@@ -293,7 +310,7 @@ def _build_group(out_dt, w_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=
                 )
             start += nt
         lines.append(
-            f"bailing_gemv_rows_run<{T}, {WT}, {XT}, {B}, {bm}, {bn}, {sm}, {sn}, {tm}, {tn}, {int(has_res)}, {int(is_swiglu)}, {K}>"
+            f"bailing_gemv_rows_run<{T}, {WT}, {XT}, {B}, {bsg}, {b_sub}, {bm}, {bn}, {sm}, {sn}, {tm}, {tn}, {int(has_res)}, {int(is_swiglu)}, {K}>"
             f"(wp, up_p, xp, rp, op, n_cur, tgp_mem, t_loc, "
             f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
         )
@@ -338,12 +355,13 @@ def gemv_rows_group(xs, ws):
     Ns = [w.shape[0] for w in ws]
     G = len(ws)
     kern, ntg = _build_group(dt, dt, dt, B, G, Ns, K, cfg)
-    bm, bn, sm, sn, tm, tn = cfg
+    bm, bn, sm, sn, tm, tn, bsg = cfg
+    y_dim = bn * bsg
     return list(
         kern(
             inputs=list(ws) + list(xs),
-            grid=(ntg * 32, bn, bm),
-            threadgroup=(32, bn, bm),
+            grid=(ntg * 32, y_dim, bm),
+            threadgroup=(32, y_dim, bm),
             output_shapes=[(B, n) for n in Ns],
             output_dtypes=[dt] * G,
         )
@@ -366,11 +384,12 @@ def gemv_rows_res(x, w, res):
     assert 1 <= B <= MAX_B and x.dtype == dt and res.shape == (B, N) and res.dtype == dt and w.shape[1] == K
     cfg = _cfg(N, K, B, False)
     kern, ntg = _build_group(dt, dt, dt, B, 1, [N], K, cfg, has_res=True)
-    bm, bn, sm, sn, tm, tn = cfg
+    bm, bn, sm, sn, tm, tn, bsg = cfg
+    y_dim = bn * bsg
     return kern(
         inputs=[w, x, res],
-        grid=(ntg * 32, bn, bm),
-        threadgroup=(32, bn, bm),
+        grid=(ntg * 32, y_dim, bm),
+        threadgroup=(32, y_dim, bm),
         output_shapes=[(B, N)],
         output_dtypes=[dt],
     )[0]
@@ -384,11 +403,12 @@ def gemv_swiglu_rows(x, w_gate, w_up):
     assert w_up.shape == (N, K) and w_gate.shape[1] == K
     cfg = _cfg(N, K, B, True)
     kern, ntg = _build_group(mx.bfloat16, mx.bfloat16, mx.bfloat16, B, 1, [N], K, cfg, is_swiglu=True)
-    bm, bn, sm, sn, tm, tn = cfg
+    bm, bn, sm, sn, tm, tn, bsg = cfg
+    y_dim = bn * bsg
     return kern(
         inputs=[w_gate, w_up, x],
-        grid=(ntg * 32, bn, bm),
-        threadgroup=(32, bn, bm),
+        grid=(ntg * 32, y_dim, bm),
+        threadgroup=(32, y_dim, bm),
         output_shapes=[(B, N)],
         output_dtypes=[mx.bfloat16],
     )[0]
@@ -401,11 +421,12 @@ def router_gemv_rows(x_bf16, w_bf16):
     assert 1 <= B <= MAX_B and x_bf16.dtype == mx.bfloat16 and w_bf16.dtype == mx.bfloat16 and w_bf16.shape[1] == K
     cfg = _cfg(N, K, B, False)
     kern, ntg = _build_group(mx.float32, mx.bfloat16, mx.bfloat16, B, 1, [N], K, cfg)
-    bm, bn, sm, sn, tm, tn = cfg
+    bm, bn, sm, sn, tm, tn, bsg = cfg
+    y_dim = bn * bsg
     return kern(
         inputs=[w_bf16, x_bf16],
-        grid=(ntg * 32, bn, bm),
-        threadgroup=(32, bn, bm),
+        grid=(ntg * 32, y_dim, bm),
+        threadgroup=(32, y_dim, bm),
         output_shapes=[(B, N)],
         output_dtypes=[mx.float32],
     )[0]

@@ -358,25 +358,56 @@ _DC_LOOP_CORE = r"""
                 int k = 0;
                 constexpr int KEND_SUB = (EXACT_BLK || FAST) ? 0 : BLOCK;
                 for (; k < KK - KEND_SUB; k += BLOCK) {
-                    thread uint32_t rw[ROWS][PPT];
-                    U sv[ROWS];
+                    if constexpr (HOIST_DQ) {
+                        thread T xt_bf[TMAX][VPT];
 #pragma unroll
-                    for (int r = 0; r < ROWS; r++) {
-                        const device uint32_t* wp = (const device uint32_t*)(ws + r * in_w);
+                        for (int t = 0; t < TMAX; t++) {
+                            if (tb + t < cnt) {
+                                const device T* xp = x + xo[t] + k;
 #pragma unroll
-                        for (int p = 0; p < PPT; p++) rw[r][p] = wp[p];
-                        sv[r] = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-                    }
+                                for (int v = 0; v < VPT; v++) xt_bf[t][v] = xp[v];
+                            }
+                        }
 #pragma unroll
-                    for (int t = 0; t < TMAX; t++) {
-                        if (tb + t < cnt) {
-                            thread U xt[VPT];
-                            load_vector<T, U, VPT>(x + xo[t] + k, xt);
+                        for (int r = 0; r < ROWS; r++) {
+                            const device uint32_t* wp = (const device uint32_t*)(ws + r * in_w);
+                            thread uint32_t rw[PPT];
 #pragma unroll
-                            for (int r = 0; r < ROWS; r++) {
-                                thread U d[VPT];
-                                dequant_vals<BITS, VPT>(rw[r], d);
-                                result[t][r] += dot_vals<BITS, VPT>(xt, d, sv[r]);
+                            for (int p = 0; p < PPT; p++) rw[p] = wp[p];
+                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            thread U d[VPT];
+                            dequant_vals<BITS, VPT>(rw, d);
+#pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (tb + t < cnt) {
+                                    thread U xt[VPT];
+#pragma unroll
+                                    for (int v = 0; v < VPT; v++) xt[v] = static_cast<U>(xt_bf[t][v]);
+                                    result[t][r] += dot_vals<BITS, VPT>(xt, d, sv);
+                                }
+                            }
+                        }
+                    } else {
+                        thread uint32_t rw[ROWS][PPT];
+                        U sv[ROWS];
+#pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            const device uint32_t* wp = (const device uint32_t*)(ws + r * in_w);
+#pragma unroll
+                            for (int p = 0; p < PPT; p++) rw[r][p] = wp[p];
+                            sv[r] = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        }
+#pragma unroll
+                        for (int t = 0; t < TMAX; t++) {
+                            if (tb + t < cnt) {
+                                thread U xt[VPT];
+                                load_vector<T, U, VPT>(x + xo[t] + k, xt);
+#pragma unroll
+                                for (int r = 0; r < ROWS; r++) {
+                                    thread U d[VPT];
+                                    dequant_vals<BITS, VPT>(rw[r], d);
+                                    result[t][r] += dot_vals<BITS, VPT>(xt, d, sv[r]);
+                                }
                             }
                         }
                     }
@@ -564,7 +595,7 @@ def moe_combine8_sh_res_rows(dn, wts, *, shared=None, residual=None):
     return out
 
 
-def moe_gate_up_swiglu_rows(x, wg, sg, wu, su, inds, *, group_size=32, bits=4, tmax=None, nsg=2, dedup=None):
+def moe_gate_up_swiglu_rows(x, wg, sg, wu, su, inds, *, group_size=32, bits=4, tmax=None, nsg=None, dedup=None):
     B, E = inds.shape
     K = x.shape[-1]
     N = wg.shape[1]
@@ -574,6 +605,8 @@ def moe_gate_up_swiglu_rows(x, wg, sg, wu, su, inds, *, group_size=32, bits=4, t
         tm = 2 if B >= 5 else _tmax(B, _GU_TMAX_CAP)
     else:
         tm = int(tmax)
+    if nsg is None:
+        nsg = 4 if B >= 5 else 2
     use_dedup = dedup is not None
     if use_dedup:
         u_exp, u_off, u_cnt, u_pqs, n_uniq = dedup
@@ -592,12 +625,12 @@ def moe_gate_up_swiglu_rows(x, wg, sg, wu, su, inds, *, group_size=32, bits=4, t
     return out
 
 
-def moe_down_combine_rows(h, wd, sd, inds, wts, *, shared=None, residual=None, group_size=32, bits=4, nsg=None, tmax=None, dedup=None):
+def moe_down_combine_rows(h, wd, sd, inds, wts, *, shared=None, residual=None, group_size=32, bits=4, nsg=None, tmax=None, dedup=None, hoist_dq=None):
     B, E, K = h.shape
     N = wd.shape[1]
     assert 1 <= B <= 24 and E == 8 and h.dtype == mx.bfloat16
     if nsg is None:
-        nsg = 8 if B >= 10 else (4 if (B <= 2 or B >= 5) else 2)
+        nsg = 4 if (B <= 2 or B >= 5) else 2
     pf = 32 // bits
     fast = (N % 8 == 0) and (K % (pf * 2 * 32) == 0)
     exact_blk = (K % (pf * 32) == 0)
@@ -605,7 +638,16 @@ def moe_down_combine_rows(h, wd, sd, inds, wts, *, shared=None, residual=None, g
     has_res = residual is not None
     sh = shared if has_sh else _ZERO_BF16
     rs = residual if has_res else _ZERO_BF16
-    tm = _tmax(B, _DC_TMAX_CAP) if tmax is None else int(tmax)
+    if tmax is None:
+        tm = 4 if B >= 17 else (2 if B >= 8 else _tmax(B, _DC_TMAX_CAP))
+    else:
+        tm = int(tmax)
+    if hoist_dq is None:
+        hdq = int(B >= 8 and tm > 1)
+    else:
+        hdq = int(bool(hoist_dq))
+    if not (fast or exact_blk) or tm == 1:
+        hdq = 0
     use_dedup = dedup is not None
     if use_dedup:
         u_exp, u_off, u_cnt, u_pqs, n_uniq = dedup
@@ -617,7 +659,7 @@ def moe_down_combine_rows(h, wd, sd, inds, wts, *, shared=None, residual=None, g
         inputs=inputs,
         template=[
             ("BB", B), ("GS", group_size), ("BITS", bits), ("FAST", fast), ("EXACT_BLK", exact_blk),
-            ("TMAX", tm), ("NSG", nsg), ("KK", K), ("NN", N), ("HAS_SH", int(has_sh)), ("HAS_RES", int(has_res)),
+            ("HOIST_DQ", hdq), ("TMAX", tm), ("NSG", nsg), ("KK", K), ("NN", N), ("HAS_SH", int(has_sh)), ("HAS_RES", int(has_res)),
         ],
         grid=(32, nsg * (N // 4), 1),
         threadgroup=(32, nsg, 1),

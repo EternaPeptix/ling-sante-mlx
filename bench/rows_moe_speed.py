@@ -1,4 +1,5 @@
 """Queued microbenchmark for rows/moe.py vs stock SwitchGLU (+ combine + shared) on L4."""
+import argparse
 import statistics as st
 import sys
 import time
@@ -7,21 +8,25 @@ from pathlib import Path
 _root = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(_root / "vendor"), str(_root)]
 
+import mlx_lm  # noqa: E402,F401
 import mlx.core as mx  # noqa: E402
-from mlx_lm.models.bailing_moe_v3.rows.gemv import gemv_rows, gemv_swiglu_rows  # noqa: E402
+from mlx_lm.models.bailing_moe_v3.rows.gemv_fp8 import gemv_lin, gemv_lin_swiglu  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.gather import gather_rows  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.moe import (  # noqa: E402
     moe_combine8_sh_res_rows,
+    moe_dedup_rows,
     moe_down_combine_rows,
     moe_gate_up_swiglu_rows,
 )
+from mlx_lm.models.bailing_moe_v3.rows.router import gate_rows  # noqa: E402
 
-from bench._layer_loader import load_layer, load_visits  # noqa: E402
+from bench._layer_loader import bit_diff_count, load_layer, load_visits  # noqa: E402
 
 
 def bench_queued(fn, reps=40, batch=16, warm=5):
     for _ in range(warm):
         mx.eval(fn())
+    mx.synchronize()
     ts = []
     for _ in range(reps):
         t0 = time.perf_counter()
@@ -31,8 +36,88 @@ def bench_queued(fn, reps=40, batch=16, warm=5):
     return 1e6 * st.median(ts)
 
 
+def bench_pipe(fn, n_lo=4, n_hi=16, reps=4):
+    mx.eval(*[fn() for _ in range(2)])
+    mx.synchronize()
+    dts = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        mx.eval(*[fn() for _ in range(n_lo)])
+        a = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        mx.eval(*[fn() for _ in range(n_hi)])
+        b = time.perf_counter() - t1
+        dts.append((b - a) * 1e6 / (n_hi - n_lo))
+    return st.median(dts)
+
+
+def sweep_large(l4):
+    sw = l4.mlp.switch_mlp
+    se = l4.mlp.shared_experts
+    gate = l4.mlp.gate
+    mx.random.seed(41)
+    print("\n=== Step 5 MoE B=1..24 Pipelined Sweep & 0-diff Verify ===", flush=True)
+    for B in (1, 2, 4, 5, 8, 12, 16, 20, 24):
+        # Generate realistic slightly correlated activations (like prompt + speculative draft tokens)
+        base = (mx.random.normal((1, 4096)) * 0.25).astype(mx.bfloat16)
+        delta = (mx.random.normal((B, 4096)) * 0.12).astype(mx.bfloat16)
+        xm = (base + delta).astype(mx.bfloat16)
+        hp = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+        inds, wts = gate_rows(
+            xm, gate.weight, gate.expert_bias,
+            top_k=gate.top_k, n_group=gate.n_group, topk_group=gate.topk_group,
+            routed_scaling_factor=gate.routed_scaling_factor,
+        )
+        sh = gemv_lin(gemv_lin_swiglu(xm, se.gate_proj, se.up_proj), se.down_proj)
+        dd = moe_dedup_rows(inds) if B >= 5 else None
+        mx.eval(xm, hp, inds, wts, sh)
+        if dd is not None:
+            mx.eval(*dd)
+            uniq = int(dd[4].item())
+        else:
+            uniq = len(set(inds.reshape(-1).tolist()))
+
+        # Reference bit-exact outputs (hoist_dq=False, baseline tmax)
+        ref_gu = moe_gate_up_swiglu_rows(xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dd, tmax=2 if B >= 5 else None, hoist_dq=False)
+        ref_dc = moe_down_combine_rows(ref_gu, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=hp, dedup=dd, tmax=1, hoist_dq=False)
+        mx.eval(ref_gu, ref_dc)
+
+        gu_res = []
+        gu_cands = [(tm, nsg, 0) for tm in ((1, 2) if B <= 4 else (2, 3, 4)) for nsg in (2, 4)]
+        for tm, nsg, hq in gu_cands:
+            g = moe_gate_up_swiglu_rows(xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dd, tmax=tm, nsg=nsg, hoist_dq=bool(hq))
+            assert bit_diff_count(g, ref_gu) == 0, f"gu diff B={B} tm={tm} nsg={nsg} hq={hq}"
+            t = bench_pipe(lambda tm=tm, nsg=nsg, hq=hq: moe_gate_up_swiglu_rows(xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dd, tmax=tm, nsg=nsg, hoist_dq=bool(hq)))
+            gu_res.append((t, f"t{tm}n{nsg}h{hq}={t:.0f}"))
+        gu_res.sort()
+
+        dc_res = []
+        dc_cands = [(tm, nsg, hq) for tm in ((1, 2) if B <= 4 else (1, 2, 4)) for nsg in (4, 8) for hq in ((0, 1) if tm > 1 else (0,))]
+        for tm, nsg, hq in dc_cands:
+            d = moe_down_combine_rows(ref_gu, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=hp, dedup=dd, tmax=tm, nsg=nsg, hoist_dq=bool(hq))
+            assert bit_diff_count(d, ref_dc) == 0, f"dc diff B={B} tm={tm} nsg={nsg} hq={hq}"
+            t = bench_pipe(lambda tm=tm, nsg=nsg, hq=hq: moe_down_combine_rows(ref_gu, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=hp, dedup=dd, tmax=tm, nsg=nsg, hoist_dq=bool(hq)))
+            dc_res.append((t, f"t{tm}n{nsg}h{hq}={t:.0f}"))
+        dc_res.sort()
+
+        cur_gu = bench_pipe(lambda: moe_gate_up_swiglu_rows(xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dd))
+        cur_dc = bench_pipe(lambda: moe_down_combine_rows(ref_gu, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=hp, dedup=dd))
+        print(
+            f"  B={B:2d} (U={uniq:2d}/{B*8:3d}): cur gu={cur_gu:5.0f} ({cur_gu*68/1e3:4.1f}ms) -> best [{', '.join(s for _, s in gu_res[:4])}] | "
+            f"cur dc={cur_dc:5.0f} ({cur_dc*68/1e3:4.1f}ms) -> best [{', '.join(s for _, s in dc_res[:4])}]",
+            flush=True,
+        )
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sweep", action="store_true")
+    a = ap.parse_args()
+
     l4, _ = load_layer(4)
+    if a.sweep:
+        sweep_large(l4)
+        return
     sw = l4.mlp.switch_mlp
     se = l4.mlp.shared_experts
     visits = load_visits(4, limit=8)
@@ -55,7 +140,7 @@ def main():
             return hp3 + (routed + se(xm3))
 
         def rows_routed_and_sh(nsg=8):
-            sh = gemv_rows(gemv_swiglu_rows(xm, se.gate_proj.weight, se.up_proj.weight), se.down_proj.weight)
+            sh = gemv_lin(gemv_lin_swiglu(xm, se.gate_proj, se.up_proj), se.down_proj)
             h_mid = moe_gate_up_swiglu_rows(
                 xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds
             )
@@ -64,7 +149,7 @@ def main():
             )
 
         def rows_gather_combine():
-            sh = gemv_rows(gemv_swiglu_rows(xm, se.gate_proj.weight, se.up_proj.weight), se.down_proj.weight)
+            sh = gemv_lin(gemv_lin_swiglu(xm, se.gate_proj, se.up_proj), se.down_proj)
             h_mid = moe_gate_up_swiglu_rows(
                 xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds
             )
@@ -74,7 +159,7 @@ def main():
         h_mid_once = moe_gate_up_swiglu_rows(
             xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds
         )
-        sh_once = gemv_rows(gemv_swiglu_rows(xm, se.gate_proj.weight, se.up_proj.weight), se.down_proj.weight)
+        sh_once = gemv_lin(gemv_lin_swiglu(xm, se.gate_proj, se.up_proj), se.down_proj)
         mx.eval(h_mid_once, sh_once)
 
         t_ref = bench_queued(stock_routed_and_sh)

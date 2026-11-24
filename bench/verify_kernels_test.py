@@ -9,12 +9,11 @@ sys.path[:0] = [str(_root / "vendor"), str(_root)]
 import mlx_lm  # noqa: E402,F401
 import mlx.core as mx  # noqa: E402
 from mlx_lm.layers.common import swiglu  # noqa: E402
-from mlx_lm.models.bailing_moe_v3.rows.gemv import (  # noqa: E402
-    gemv_rows,
-    gemv_rows_multi,
-    gemv_rows_res,
-    gemv_swiglu_rows,
-    router_gemv_rows,
+from mlx_lm.models.bailing_moe_v3.rows.gemv_fp8 import (  # noqa: E402
+    gemv_lin,
+    gemv_lin_multi,
+    gemv_lin_res,
+    gemv_lin_swiglu,
 )
 from mlx_lm.models.bailing_moe_v3.rows.kda import (  # noqa: E402
     kda_gdn_advance_only,
@@ -69,23 +68,22 @@ def test_gemv(l0, l4, l7, norm, lm_head):
 
         # Dense SwiGLU + Shared SwiGLU + down_res
         ref_sw = mx.concatenate([swiglu(l0.mlp.gate_proj(x[b : b + 1]), l0.mlp.up_proj(x[b : b + 1])) for b in range(B)], axis=0)
-        got_sw = gemv_swiglu_rows(x, l0.mlp.gate_proj.weight, l0.mlp.up_proj.weight)
+        got_sw = gemv_lin_swiglu(x, l0.mlp.gate_proj, l0.mlp.up_proj)
         ok &= check(f"gemv_swiglu(dense) B={B}", got_sw, ref_sw)
 
         se = l4.mlp.shared_experts
         ref_sh = mx.concatenate([swiglu(se.gate_proj(x[b : b + 1]), se.up_proj(x[b : b + 1])) for b in range(B)], axis=0)
-        got_sh = gemv_swiglu_rows(x, se.gate_proj.weight, se.up_proj.weight)
+        got_sh = gemv_lin_swiglu(x, se.gate_proj, se.up_proj)
         ok &= check(f"gemv_swiglu(shared) B={B}", got_sh, ref_sh)
 
         ref_dr = mx.concatenate([l0.mlp.down_proj(v_dense[b : b + 1]) + x[b : b + 1] for b in range(B)], axis=0)
-        got_dr = gemv_rows_res(v_dense, l0.mlp.down_proj.weight, x)
+        got_dr = gemv_lin_res(v_dense, l0.mlp.down_proj, x)
         ok &= check(f"gemv_rows_res(dense) B={B}", got_dr, ref_dr)
 
         # KDA qkvfgb
         a4 = l4.attention
-        ws = [a4.q_proj.weight, a4.k_proj.weight, a4.v_proj.weight, a4.f_proj.weight, a4.g_proj.weight, a4.b_proj.weight]
         ps = [a4.q_proj, a4.k_proj, a4.v_proj, a4.f_proj, a4.g_proj, a4.b_proj]
-        gots = gemv_rows_multi(x, ws)
+        gots = gemv_lin_multi(x, ps)
         for nm, g, p in zip(("q", "k", "v", "f", "g", "b"), gots, ps):
             ref = mx.concatenate([p(x[b : b + 1]) for b in range(B)], axis=0)
             ok &= check(f"kda.{nm}_proj B={B}", g, ref)
@@ -93,7 +91,7 @@ def test_gemv(l0, l4, l7, norm, lm_head):
         if B in (1, 4, 8, 12, 14, 15, 16, 20, 24):
             # MLA q_b + router + lm_head
             ref_qb = mx.concatenate([l7.attention.q_b_proj(qa[b : b + 1]) for b in range(B)], axis=0)
-            got_qb = gemv_rows(qa, l7.attention.q_b_proj.weight)
+            got_qb = gemv_lin(qa, l7.attention.q_b_proj)
             ok &= check(f"mla.q_b_proj B={B}", got_qb, ref_qb)
 
             ref_inds, ref_wts = [], []
@@ -108,17 +106,17 @@ def test_gemv(l0, l4, l7, norm, lm_head):
             # lm_head
             hn = rms_norm_rows(x, norm.weight, norm.eps)
             ref_lh = mx.concatenate([lm_head(hn[b : b + 1]) for b in range(B)], axis=0)
-            got_lh = gemv_rows(hn, lm_head.weight)
+            got_lh = gemv_lin(hn, lm_head)
             ok &= check(f"lm_head B={B}", got_lh, ref_lh)
 
     print("  --- GEMV qkvfgb & lm_head micro-timing (us) ---", flush=True)
     a4 = l4.attention
-    ws = [a4.q_proj.weight, a4.k_proj.weight, a4.v_proj.weight, a4.f_proj.weight, a4.g_proj.weight, a4.b_proj.weight]
+    ps = [a4.q_proj, a4.k_proj, a4.v_proj, a4.f_proj, a4.g_proj, a4.b_proj]
     for B in (8, 12, 14, 15, 16, 20, 24):
         x = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
         mx.eval(x)
-        t_qkv = bench_ms(lambda: gemv_rows_multi(x, ws))
-        t_lh = bench_ms(lambda: gemv_rows(x, lm_head.weight))
+        t_qkv = bench_ms(lambda: gemv_lin_multi(x, ps))
+        t_lh = bench_ms(lambda: gemv_lin(x, lm_head))
         print(f"    B={B:2d}: kda_qkvfgb={t_qkv*1000:.0f}us  lm_head={t_lh*1000:.0f}us", flush=True)
     return ok
 
@@ -154,7 +152,7 @@ def test_moe(l4, l64):
         # Heavy overlap across rows & within rows to exercise multi-chunk NPAIR > 32 dedup
         inds = mx.array([[((b * 3 + k) % 24) if (b % 2 == 0) else (17 if k < 3 else (b * 11 + k * 7) % 512) for k in range(8)] for b in range(B)], dtype=mx.uint32)
         wts = mx.softmax(mx.random.normal((B, 8)), axis=-1) * 2.5
-        sh = gemv_rows(gemv_swiglu_rows(xm, se.gate_proj.weight, se.up_proj.weight), se.down_proj.weight)
+        sh = gemv_lin(gemv_lin_swiglu(xm, se.gate_proj, se.up_proj), se.down_proj)
         mx.eval(xm, hp, inds, wts, sh)
 
         ref_m, ref_comb = stock_routed_b1(l4, xm, inds, wts)
@@ -250,8 +248,8 @@ def test_kda(l0, l4):
             # Fast path
             x_flat = x_seq.reshape(C * L, 4096)
             h_in = rms_norm_rows(x_flat, layer.input_layernorm.weight, layer.input_layernorm.eps)
-            q_r, k_r, v_r, f_r, g_r, b_r = gemv_rows_multi(
-                h_in, [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight, attn.f_proj.weight, attn.g_proj.weight, attn.b_proj.weight]
+            q_r, k_r, v_r, f_r, g_r, b_r = gemv_lin_multi(
+                h_in, [attn.q_proj, attn.k_proj, attn.v_proj, attn.f_proj, attn.g_proj, attn.b_proj]
             )
             cs0 = mx.concatenate([cs_init[c][0] for c in range(C)], axis=0)
             cs1 = mx.concatenate([cs_init[c][1] for c in range(C)], axis=0)
@@ -263,7 +261,7 @@ def test_kda(l0, l4):
                 attn.A_log, attn.dt_bias, C=C, L=L, lower_bound=attn.lower_bound, eps=1e-6,
             )
             ov, s_end = kda_gdn_verify_seq_rows(q, k, v, g, beta, cs3, g_r, attn.o_norm.weight, C=C, L=L, eps=attn.o_norm.eps)
-            got_hpost = gemv_rows_res(ov, attn.o_proj.weight, x_flat)
+            got_hpost = gemv_lin_res(ov, attn.o_proj, x_flat)
             ok &= check(f"{lname} C={C} L={L:2d} h_post", got_hpost, ref_hpost)
 
             ref_s_end = mx.concatenate([step_states[c][L][3] for c in range(C)], axis=0)
