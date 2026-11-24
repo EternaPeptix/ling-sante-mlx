@@ -70,6 +70,10 @@ class Model(nn.Module):
         )
 
     def __call__(self, inputs: mx.array, cache: Any | None = None) -> mx.array:
+        from .fastdecode import can_fast_decode, fast_decode_forward
+
+        if can_fast_decode(self, inputs, cache):
+            return fast_decode_forward(self, inputs, cache)
         hidden = self.model(inputs, cache)
         if self.lm_head is None:
             return self.model.word_embeddings.as_linear(hidden)
