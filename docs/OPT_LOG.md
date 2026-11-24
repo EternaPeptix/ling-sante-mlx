@@ -142,3 +142,57 @@ Final `profile_fast.py` (`profile_fast_w5.json`, `NOPS=64`): `1,260` graph nodes
 - `tools/run_eval.py gen`: all 6 greedy prompts at `17.4 tok/s` (up from `14.3–14.4 tok/s`).
 - `tools/run_eval.py ppl`: `chunk 64: mean NLL 0.04473, ppl 1.0458`; `chunk 512: mean NLL 0.04646, ppl 1.0476`; `ppl ratio chunk64/chunk512 = 0.99828` (identical to stock).
 - Live HTTP `mlx_lm.server` (`512S1:8080`, `--decode-concurrency 4 --prompt-concurrency 1`): `bench/http_smoke.py` (`max_tokens=128`, `temperature=0.0`): `C=1` end-to-end (incl. prompt processing) `14.28–14.90 tok/s` (`72–128` tok); `C=4` concurrent `423 tok in 11.13s (38.00 agg tok/s, incl. staggered stream completions at 72/95/128 tok)`, `exact_vs_C1=True`.
+
+## Phase 1–3.5: Multi-Token Verification Kernels (`C*L <= 24`), Native MTP Layer-72 Conversion, & >= 80 tok/s Bit-Exact Speculative Decoding
+
+### Built-in MTP Layer-72 (`model.layers.72.*`) & Multi-Token Verification (`verify_decode.py`, `rows/*`)
+1. Converted native MTP Layer 72 weights via `tools/convert_mtp.py` (`512S1:~/science/models/lingsante-mlx-mxfp4-bf16/mtp/model-mtp.safetensors`, `4.2 GiB` on disk / `4.520 GB` weights, SHA-256 `18df4cf9378a21ae3dd44aa1ad9060d2f88e95a8a67002e0f9e48a230e921aec`), paired in `vendor/mlx_lm/models/bailing_moe_v3/mtp.py` with a draft-only 4-bit affine `q4_head` (while target verification keeps full bf16 `lm_head`).
+2. Extended custom Metal row kernels in `vendor/mlx_lm/models/bailing_moe_v3/rows/` cleanly up to `B = C * L <= 24` (`B <= 4` path preserved bit-for-bit):
+   - `rows/gemv.py`: `MAX_B = 24`, `inter[TM][TN]`-first K-loop, tuned `_cfg` tiling for `5 <= B <= 24`.
+   - `rows/moe.py`: chunked >32-lane dedup, single-simdgroup CSR `moe_dedup_rows` + dedup-consuming `_gu_kernel` / `_dc_kernel` (`C*L >= 5`), `EXACT_BLK` unrolled loop on `K=1280`.
+   - `rows/kda.py`: fused `kda_pre_seq_rows`, `kda_gdn_verify_seq_rows`, per-stream `kda_gdn_verify_seq_split_rows` (`ArraysCache(3 + C)` so accepted streams require zero state copy), `kda_gdn_advance_split_only`, and `kda_slice_conv_rows`.
+   - `rows/mla.py`: `mla_verify_layer_rows` and single-pass `mla_verify_varlen_rows` (`list[KVCache]` unpadded exact MLA verification & O(1) rollback).
+   - `verify_decode.py`: `LINGSANTE_VERIFY_FLUSH=4` mid-forward `mx.async_eval(x)` overlapping Python graph construction & Metal buffer submission with GPU execution.
+3. Kernel & rollback gates (`SUMMARY: ALL PASS`, **0 bit diffs**):
+   - `bench/verify_kernels_test.py`: GEMV `B=1..24`, MoE `B=1..24` + CSR dedup + `EXACT_BLK` + all-duplicate collision stress, split KDA + `adv_split` `M=1..4`, and varlen MLA `Ls=[3,1,2,1]` / `[2,3,1,3]` — `SUMMARY: ALL PASS`.
+   - `bench/verify_model_bench.py` (`verify_bench_v4.json`, `exact_ok=True` across adversarial rollback):
+     * `C=1 L=1 (B=1)`: `58.14 ms` (`17.14 tok/s`, `commit_full=0.195 ms`, `324.45 GB`).
+     * `C=1 L=12 (B=12)`: `106.29 ms` (`ceil 112.69 tok/s`, `commit_full=0.196 ms, rollback_half=1.694 ms`).
+     * `C=1 L=16 (B=16)`: `128.13 ms` (`ceil 124.68 tok/s`).
+     * `C=4 L=2 (B=8)`: `88.50 ms` (`ceil 90.11 tok/s`, `rollback_half=4.445 ms`).
+     * **`C=4 L=3 (B=12)`**: **`105.73 ms`** (`ceil 113.20 tok/s`, `commit_full=0.275 ms`, `rollback_half=4.422 ms`, `328.30 GB`).
+     * `C=4 L=4 (B=16)`: `129.38 ms` (`ceil 123.40 tok/s`).
+
+### Native MTP vs External `Ling-3.0-tiny` Drafter (`spec_async_final.json` vs `spec_tiny_phase3.json`, all `td=0, ld=0`)
+- Standalone `inclusionAI/Ling-3.0-tiny` 4-bit MLX (`c1=172.34 tok/s`, `c4=433.20 agg tok/s` / `9.23 ms/step`) used as external drafter (`bench/spec_tiny_bench.py`, `spec_tiny_phase3.json`):
+  * `C=1 tiny K=4`: `22.75 tok/s` (`E_acc=2.811`, `verify=81.4 ms`, `draft=32.5 ms`); hybrid `MTP+tiny K=4`: `25.99 tok/s` (`E_acc=3.243`).
+  * `C=4 tiny K=2`: `43.22 agg tok/s` (`E_acc=1.764`, `verify=122.77 ms`, `draft=39.24 ms`, `338.89 GB`).
+- Single-sync GPU-chained **native MTP Layer 72** (`bench/spec_async_bench.py`, `spec_async_final.json`, all `exact=True (td=0, ld=0)`):
+  * `C=1 K=2`: `33.52 tok/s` (`E_acc=2.446`, `72.46 ms`); `K=3`: `34.05 tok/s` (`E_acc=2.733`, `78.02 ms`); **`K=4`: `34.06 tok/s`** (`E_acc=2.819`, `81.45 ms`); `256tok K=4`: **`35.17 tok/s`** (`E_acc=2.876`).
+  * `C=2 K=2 (B=6)`: `54.81 agg / 56.45 steady tok/s` (`E_acc=2.466`, `85.82 ms`, `332.01 GB`); `K=3 (B=8)`: `54.92 agg / 56.75 steady tok/s` (`E_acc=2.822`, `94.38 ms`).
+  * `C=3 K=2 (B=9)`: `69.35 agg / 71.38 steady tok/s` (`E_acc=2.474`, `101.74 ms`, `333.72 GB`).
+  * **`C=4 K=2 (B=12)`**: **`80.04 agg / 81.55 steady tok/s`** (`20.01/stream`, `E_acc=2.442`, `alphas=[0.870, 0.674]`, `117.54 ms`, `335.47 GB`); `256tok K=2`: `77.90 agg / 80.80 steady tok/s` (`115.88 ms`, `335.55 GB`).
+  * `C=4 K=3 (B=16)`: `73.32 agg / 74.18 steady tok/s` (`E_acc=2.717`, `138.57 ms`, `335.56 GB`).
+
+## Step C: Production Integration (`vendor/mlx_lm`), End-to-End Verification, & Live HTTP Server (`512S1:8080`)
+
+Wired native MTP cleanly into `vendor/mlx_lm` (`LINGSANTE_MTP=1` default-on when `mtp/model-mtp.safetensors` is present; auto-adaptive `K=4` at `C=1` and `K=2` at `2<=C<=4`; exact fallback to `fast_decode_forward` for `temp > 0` or `logits_processors`):
+- `utils.py`: `attach_lingsante_mtp` on non-lazy LingSante model loads (wrapped in `_MTPBox` so `nn.Module.parameters()` is unchanged).
+- `spec_engine.py`: `LingSanteSpecBatch` (`BatchGenerator`/`GenerationBatch` with zero-copy extend/contraction & `_lingsante_mtp_state` prompt-cache preservation across `LRUPromptCache`) and `mtp_generate_step` (`generate_step`).
+- `generate.py`, `sample_utils.py`, `server.py`: tagged greedy/non-greedy samplers, chunked prefill hidden capture (`PromptProcessingBatch`), continuous batching lifecycle (`GenerationBatch`), and mid-burst stop handling.
+
+### Final Production Verification (`512S1`, all `0` bit diffs vs stock `B=1`)
+- `bench/batch_dec.py --C 1,2,3,4 --tokens 128 --reps 2 --mode batchgen` (`batchgen_mtp_final.json`):
+  * **`C=1`**: **`32.99 agg tok/s`** (`79.97 ms/step`, `329.73 GB`), `exact_tok=True`, `exact_lp32=True` (`{}` diffs)
+  * **`C=2`**: **`56.61 agg tok/s`** (`28.31/stream`, `86.52 ms/step`, `330.85 GB`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=3`**: **`70.64 agg tok/s`** (`23.55/stream`, `104.22 ms/step`, `331.99 GB`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=4`**: **`80.56 agg tok/s`** (`20.14/stream`, `120.54 ms/step`, **`332.89 GB`** vs stock `358.97 GB`), `exact_tok=True`, `exact_lp32=True`
+- `LINGSANTE_MTP=0 python bench/batch_dec.py --C 1,4 --tokens 128 --reps 2 --mode batchgen`: `C=1: 17.38 tok/s`, `C=4: 49.33 tok/s`, `exact_tok=True`, `exact_lp32=True` (zero regression).
+- `bench/server_exact_test.py` (`LINGSANTE_MTP=1`, dynamic `1 -> 4 -> 2 -> 3 -> 1`, 5 requests): `SUMMARY: ALL PASS` (`exact_tok=True`, `exact_lp=True`).
+- Edge-case verification (`EDGE_CASES_PASS`): `max_tokens=1/2`, `copy.deepcopy` Turn-2 `prompt_cache` resume (`M=1` & `M>1`), `remove(return_prompt_caches=True)` mid-flight, mixed `temp=0.7` + greedy exit/re-entry, `stop_sequences`, and `generate_step` early break + continuation.
+- `bench/ctx_exact_test.py --ctx 2048 --tokens 32 --mtp`: `SUMMARY: ALL PASS` (`fastdecode C=1, 4` at `15.55 / 44.98 tok/s` AND `mtp generate_step C=1` AND `mtp BatchGenerator C=1, 4` all `exact_tok=True exact_lp=True`).
+- `tools/run_eval.py gen`: all 6 medical/chemistry/biology prompts fluent at `32.1–38.8 tok/s`; `tools/run_eval.py ppl`: `chunk 64 mean NLL 0.04473 (ppl 1.0458)`, `chunk 512 mean NLL 0.04646 (ppl 1.0476)`, `ratio 0.99828`.
+- Live HTTP `mlx_lm.server` (`512S1:8080`, `LINGSANTE_MTP=1`, `--decode-concurrency 4 --prompt-concurrency 1`):
+  * `bench/http_smoke.py --max-tokens 128`: `C=1`: `23.33–33.45 tok/s` (`72–128` tok); `C=4` concurrent: `423 tok in 6.45s` (**`65.58 agg tok/s`** end-to-end incl. HTTP/prefill/staggered finishes, up from `38.00`), **`exact_vs_C1=True`**.
+  * `bench/http_smoke.py --max-tokens 256`: `C=1`: `26.58–36.70 tok/s` (`72–217` tok); `C=4` concurrent: `517 tok in 8.73s` (**`59.22 agg tok/s`** incl. natural EOS stagger `72..217` tok), **`exact_vs_C1=True`**.
+  * Non-greedy `temperature=0.7` `/v1/chat/completions` HTTP sanity check: HTTP `200`, clean `Prompt Cache` reuse in `server.log`.

@@ -15,6 +15,15 @@ from .rows.router import gate_rows
 def can_fast_decode(model, inputs, cache) -> bool:
     if os.environ.get("LINGSANTE_FAST_DECODE", "1") in ("0", ""):
         return False
+    args = getattr(model, "args", None)
+    if (
+        args is None
+        or args.hidden_size != 4096
+        or args.num_attention_heads != 64
+        or args.num_experts != 512
+        or args.moe_intermediate_size != 1280
+    ):
+        return False
     if model.training or model.lm_head is None or inputs.ndim != 2 or inputs.shape[1] != 1:
         return False
     B = inputs.shape[0]

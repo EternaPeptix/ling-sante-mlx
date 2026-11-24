@@ -402,6 +402,34 @@ def generate_step(
 
     sampler = sampler or greedy_sampler
 
+    if (
+        input_embeddings is None
+        and kv_bits is None
+        and max_kv_size is None
+        and not logits_processors
+        and getattr(model, "_lingsante_mtp_holder", None) is not None
+    ):
+        from .models.bailing_moe_v3.spec_engine import (
+            get_lingsante_mtp,
+            is_greedy_sampler,
+            mtp_generate_step,
+        )
+
+        if (mtp := get_lingsante_mtp(model)) is not None and is_greedy_sampler(
+            sampler
+        ):
+            yield from mtp_generate_step(
+                prompt,
+                model,
+                mtp,
+                stream,
+                max_tokens=max_tokens,
+                prompt_cache=prompt_cache,
+                prefill_step_size=prefill_step_size,
+                prompt_progress_callback=prompt_progress_callback,
+            )
+            return
+
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
             return model(
@@ -1171,6 +1199,12 @@ class PromptProcessingBatch:
     ):
         self.model = model
         self.uids = uids
+        self._mtp_states = []
+        for c_list in caches:
+            st = getattr(c_list[-1], "_lingsante_mtp_state", None) if c_list else None
+            if st is not None:
+                delattr(c_list[-1], "_lingsante_mtp_state")
+            self._mtp_states.append(st)
         self.prompt_cache = _merge_caches(caches)
         self.tokens = tokens if tokens is not None else [[] for _ in uids]
 
@@ -1195,12 +1229,23 @@ class PromptProcessingBatch:
         return len(self.uids)
 
     def extract_cache(self, idx: int) -> List[Any]:
-        return [c.extract(idx) for c in self.prompt_cache]
+        out = [c.extract(idx) for c in self.prompt_cache]
+        st = self._mtp_states[idx] if idx < len(self._mtp_states) else None
+        if st is not None and out:
+            mc, pending_h = st
+            mc_copy = type(mc)()
+            if getattr(mc, "keys", None) is not None and mc.offset > 0:
+                mc_copy.keys = mx.contiguous(mc.keys[..., : mc.offset, :])
+                mc_copy.values = mx.contiguous(mc.values[..., : mc.offset, :])
+                mc_copy.offset = mc.offset
+            out[-1]._lingsante_mtp_state = (mc_copy, pending_h)
+        return out
 
     def extend(self, batch):
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
+        self._mtp_states.extend(batch._mtp_states)
         self.samplers.extend(batch.samplers)
         self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
@@ -1212,6 +1257,7 @@ class PromptProcessingBatch:
         new_batch.uids = list(self.uids)
         new_batch.prompt_cache = copy.deepcopy(self.prompt_cache)
         new_batch.tokens = list(self.tokens)
+        new_batch._mtp_states = list(self._mtp_states)
         new_batch.prefill_step_size = self.prefill_step_size
         new_batch.samplers = list(self.samplers)
         new_batch.fallback_sampler = self.fallback_sampler
@@ -1237,6 +1283,7 @@ class PromptProcessingBatch:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
+        self._mtp_states = [self._mtp_states[idx] for idx in keep]
         self.samplers = [self.samplers[idx] for idx in keep]
         self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
@@ -1275,11 +1322,34 @@ class PromptProcessingBatch:
         else:
             tokens = mx.array(tokens)
 
+        mtp = None
+        if (
+            len(self.uids) == 1
+            and max_padding == 0
+            and getattr(self.model, "_lingsante_mtp_holder", None) is not None
+        ):
+            from .models.bailing_moe_v3.spec_engine import (
+                get_lingsante_mtp,
+                mtp_prefill_chunk,
+            )
+
+            mtp = get_lingsante_mtp(self.model)
+
         # Actual prompt processing loop
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
-            self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
-            mx.eval([c.state for c in self.prompt_cache])
+            chunk = tokens[:, :n_to_process]
+            if mtp is not None:
+                h = self.model.model(chunk, cache=self.prompt_cache)
+                mx.eval(h, [c.state for c in self.prompt_cache])
+                self._mtp_states[0] = mtp_prefill_chunk(
+                    mtp, chunk, h, self._mtp_states[0]
+                )
+            else:
+                self.model(chunk, cache=self.prompt_cache)
+                mx.eval([c.state for c in self.prompt_cache])
+                if self._mtp_states:
+                    self._mtp_states = [None] * len(self.uids)
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
 
@@ -1315,11 +1385,13 @@ class PromptProcessingBatch:
             self.logits_processors,
             self.stop_sequences,
             self.max_tokens,
+            mtp_states=self._mtp_states,
         )
 
         self.uids = []
         self.prompt_cache = []
         self.tokens = []
+        self._mtp_states = []
         self.samplers = []
         self.logits_processors = []
         self.max_tokens = []
@@ -1376,6 +1448,7 @@ class GenerationBatch:
         logits_processors: Optional[List[List[LogitsProcessor]]],
         stop_sequences: List[StopSequences],
         max_tokens: List[int],
+        mtp_states: Optional[List[Any]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1400,15 +1473,123 @@ class GenerationBatch:
         self._token_context = [TokenBuffer(t) for t in tokens]
         self._num_tokens = [0] * len(self.uids)
         self._matchers = [ss.matcher() for ss in stop_sequences]
+        self._spec = None
 
         if self.uids:
+            if getattr(self.model, "_lingsante_mtp_holder", None) is not None:
+                from .models.bailing_moe_v3.spec_engine import (
+                    LingSanteSpecBatch,
+                    get_lingsante_mtp,
+                )
+
+                if (
+                    (mtp := get_lingsante_mtp(self.model)) is not None
+                    and LingSanteSpecBatch.can_use(
+                        self.model,
+                        self.uids,
+                        self.samplers,
+                        self.fallback_sampler,
+                        self.logits_processors,
+                    )
+                ):
+                    self._spec = LingSanteSpecBatch.init_from_prompt(
+                        self.model, mtp, inputs, self.prompt_cache, mtp_states
+                    )
+                    for sti, ti in zip(self.tokens, inputs.tolist()):
+                        sti.append(ti)
+                    self.prompt_cache = []
+                    self._next_tokens = None
+                    return
             self._step()
 
     def __len__(self):
         return len(self.uids)
 
+    def _filter_metadata(self, keep: List[int]):
+        self.uids = [self.uids[idx] for idx in keep]
+        self.tokens = [self.tokens[idx] for idx in keep]
+        self.samplers = [self.samplers[idx] for idx in keep]
+        self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        self.max_tokens = [self.max_tokens[idx] for idx in keep]
+        self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
+        self._token_context = [self._token_context[idx] for idx in keep]
+        self._num_tokens = [self._num_tokens[idx] for idx in keep]
+        self._matchers = [self._matchers[idx] for idx in keep]
+
+    def _clear_all(self):
+        self._filter_metadata([])
+        self.prompt_cache.clear()
+        self._spec = None
+        self._current_tokens = None
+        self._current_logprobs = []
+        self._next_tokens = None
+        self._next_logprobs = []
+
+    def _exit_spec_mode(self):
+        if self._spec is None:
+            return
+        spec = self._spec
+        self._spec = None
+        self.prompt_cache = spec.to_standard_cache()
+        self._current_tokens = None
+        self._current_logprobs = []
+        self._next_tokens = mx.array(spec.cur_toks, dtype=mx.uint32)
+        self._next_logprobs = list(spec.cur_lps)
+        self._token_context = [TokenBuffer(t) for t in self.tokens]
+
+    @property
+    def cache_nbytes(self) -> int:
+        if self._spec is not None:
+            return self._spec.nbytes()
+        return sum(c.nbytes for c in self.prompt_cache)
+
     def extend(self, batch):
         """Extend this batch with another generation batch."""
+        if not batch.uids:
+            return
+
+        if len(self.uids) == 0 and batch._spec is not None:
+            self.uids.extend(batch.uids)
+            self.tokens.extend(batch.tokens)
+            self.samplers.extend(batch.samplers)
+            self.logits_processors.extend(batch.logits_processors)
+            self.max_tokens.extend(batch.max_tokens)
+            self.stop_sequences.extend(batch.stop_sequences)
+            self._token_context.extend(batch._token_context)
+            self._num_tokens.extend(batch._num_tokens)
+            self._matchers.extend(batch._matchers)
+            self._spec = batch._spec
+            batch._spec = None
+            self.prompt_cache = []
+            self._current_tokens = None
+            self._current_logprobs = []
+            self._next_tokens = None
+            self._next_logprobs = []
+            return
+
+        if (
+            self._spec is not None
+            and batch._spec is not None
+            and (len(self.uids) + len(batch.uids)) <= 4
+        ):
+            self._spec.extend(batch._spec)
+            batch._spec = None
+            self.uids.extend(batch.uids)
+            self.tokens.extend(batch.tokens)
+            self.samplers.extend(batch.samplers)
+            self.logits_processors.extend(batch.logits_processors)
+            self.max_tokens.extend(batch.max_tokens)
+            self.stop_sequences.extend(batch.stop_sequences)
+            self._token_context.extend(batch._token_context)
+            self._num_tokens.extend(batch._num_tokens)
+            self._matchers.extend(batch._matchers)
+            return
+
+        if self._spec is not None:
+            self._exit_spec_mode()
+        if batch._spec is not None:
+            batch._exit_spec_mode()
+
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
@@ -1496,10 +1677,20 @@ class GenerationBatch:
         return inputs, self._current_logprobs
 
     def extract_cache(self, idx: int) -> List[Any]:
+        if self._spec is not None:
+            return self._spec.extract_cache(idx)
         return [c.extract(idx) for c in self.prompt_cache]
 
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
+        if self._spec is not None:
+            if not keep:
+                self._clear_all()
+            else:
+                self._spec.filter(keep)
+                self._filter_metadata(keep)
+            return
+
         self.uids = [self.uids[idx] for idx in keep]
         if not keep:
             self.prompt_cache.clear()
@@ -1512,13 +1703,15 @@ class GenerationBatch:
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
 
-        self._next_tokens = self._next_tokens[keep] if keep else None
+        self._next_tokens = (
+            self._next_tokens[keep] if (keep and self._next_tokens is not None) else None
+        )
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
         self._matchers = [self._matchers[idx] for idx in keep]
 
-    def next(self) -> List[Response]:
+    def next(self, *, prefetch: bool = True) -> List[Response]:
         """
         Generate the next batch of tokens.
 
@@ -1527,6 +1720,9 @@ class GenerationBatch:
         """
         if not self.uids:
             return []
+
+        if self._spec is not None:
+            return self._spec.step_next(self, prefetch=prefetch)
 
         tokens, logprobs = self._step()
 
@@ -1825,7 +2021,7 @@ class BatchGenerator:
     def prompt_cache_nbytes(self):
         total = sum(c.nbytes for p in self._unprocessed_sequences for c in p[3])
         total += sum(c.nbytes for c in self._prompt_batch.prompt_cache)
-        total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
+        total += self._generation_batch.cache_nbytes
         return total
 
     def _make_batch(self, n: int):
@@ -1869,7 +2065,10 @@ class BatchGenerator:
         # Generate tokens first
         if len(self._generation_batch) > 0:
             tic = time.perf_counter()
-            generation_responses = self._generation_batch.next()
+            prefetch = len(self._generation_batch) >= self.completion_batch_size or (
+                not self._unprocessed_sequences and not self._currently_processing
+            )
+            generation_responses = self._generation_batch.next(prefetch=prefetch)
             self._counters.decode_time += time.perf_counter() - tic
             self._counters.generation_tokens += len(generation_responses)
             self._counters.generation_steps += 1

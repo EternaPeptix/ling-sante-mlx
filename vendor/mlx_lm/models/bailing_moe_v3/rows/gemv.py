@@ -15,7 +15,7 @@ import mlx.core as mx
 
 from .glue import GLUE_HEADER
 
-MAX_B = 8
+MAX_B = 24
 _KERNELS = {}
 _GEMV_BM_LARGE = int(os.environ.get("LINGSANTE_GEMV_BM", "8"))
 
@@ -51,8 +51,6 @@ METAL_FUNC void bailing_gemv_rows_run(
       if constexpr (SWIGLU) result_up[b][tm] = 0.0f;
     }
   }
-  WT inter[TN];
-  float v_coeff[B][TN];
 
   const int thrM = SN != 32 ? int(simd_lid) / SN : 0;
   const int thrN = SN != 32 ? int(simd_lid) % SN : int(simd_lid);
@@ -73,90 +71,82 @@ METAL_FUNC void bailing_gemv_rows_run(
   constexpr int leftover = KK - last_iter;
 
   for (int i = 0; i < n_iter; ++i) {
-#pragma unroll
-    for (int b = 0; b < B; b++) {
-      if constexpr (TN == 4 && sizeof(XT) == 2) {
-        Bf4 px = *(const device Bf4*)(in_vec + b * KK + bn);
-#pragma unroll
-        for (int tn = 0; tn < 4; tn++) v_coeff[b][tn] = static_cast<float>(as_type<bfloat16_t>(px.v[tn]));
-      } else {
-#pragma unroll
-        for (int tn = 0; tn < TN; tn++) {
-          v_coeff[b][tn] = static_cast<float>(in_vec[b * KK + bn + tn]);
-        }
-      }
-    }
-    int mat_offset = 0;
+    WT inter[TM][TN];
+    WT inter_up[SWIGLU ? TM : 1][SWIGLU ? TN : 1];
 #pragma unroll
     for (int tm = 0; tm < TM; tm++) {
+      const size_t mo = size_t(tm) * KK + bn;
       if constexpr (TN == 4 && sizeof(WT) == 2) {
-        Bf4 pk = *(const device Bf4*)(mat + mat_offset + bn);
+        Bf4 pk = *(const device Bf4*)(mat + mo);
 #pragma unroll
-        for (int tn = 0; tn < 4; tn++) inter[tn] = as_type<bfloat16_t>(pk.v[tn]);
+        for (int tn = 0; tn < 4; tn++) inter[tm][tn] = as_type<bfloat16_t>(pk.v[tn]);
       } else {
 #pragma unroll
-        for (int tn = 0; tn < TN; tn++) inter[tn] = mat[mat_offset + bn + tn];
-      }
-#pragma unroll
-      for (int b = 0; b < B; b++) {
-#pragma unroll
-        for (int tn = 0; tn < TN; tn++) {
-          result[b][tm] += static_cast<float>(inter[tn]) * v_coeff[b][tn];
-        }
+        for (int tn = 0; tn < TN; tn++) inter[tm][tn] = mat[mo + tn];
       }
       if constexpr (SWIGLU) {
         if constexpr (TN == 4 && sizeof(WT) == 2) {
-          Bf4 pk = *(const device Bf4*)(mat_up + mat_offset + bn);
+          Bf4 pk = *(const device Bf4*)(mat_up + mo);
 #pragma unroll
-          for (int tn = 0; tn < 4; tn++) inter[tn] = as_type<bfloat16_t>(pk.v[tn]);
+          for (int tn = 0; tn < 4; tn++) inter_up[tm][tn] = as_type<bfloat16_t>(pk.v[tn]);
         } else {
 #pragma unroll
-          for (int tn = 0; tn < TN; tn++) inter[tn] = mat_up[mat_offset + bn + tn];
+          for (int tn = 0; tn < TN; tn++) inter_up[tm][tn] = mat_up[mo + tn];
         }
+      }
+    }
 #pragma unroll
-        for (int b = 0; b < B; b++) {
+    for (int b = 0; b < B; b++) {
+      float vc[TN];
+      if constexpr (TN == 4 && sizeof(XT) == 2) {
+        Bf4 px = *(const device Bf4*)(in_vec + b * KK + bn);
 #pragma unroll
-          for (int tn = 0; tn < TN; tn++) {
-            result_up[b][tm] += static_cast<float>(inter[tn]) * v_coeff[b][tn];
+        for (int tn = 0; tn < 4; tn++) vc[tn] = static_cast<float>(as_type<bfloat16_t>(px.v[tn]));
+      } else {
+#pragma unroll
+        for (int tn = 0; tn < TN; tn++) vc[tn] = static_cast<float>(in_vec[b * KK + bn + tn]);
+      }
+#pragma unroll
+      for (int tm = 0; tm < TM; tm++) {
+#pragma unroll
+        for (int tn = 0; tn < TN; tn++) {
+          result[b][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
+          if constexpr (SWIGLU) {
+            result_up[b][tm] += static_cast<float>(inter_up[tm][tn]) * vc[tn];
           }
         }
       }
-      mat_offset += KK;
     }
     bn += blockN;
   }
 
   if constexpr (leftover > 0) {
-#pragma unroll
-    for (int b = 0; b < B; b++) {
-#pragma unroll
-      for (int tn = 0; tn < TN; tn++) {
-        v_coeff[b][tn] = (bn + tn < KK) ? static_cast<float>(in_vec[b * KK + bn + tn]) : 0.0f;
-      }
-    }
+    WT inter[TM][TN];
+    WT inter_up[SWIGLU ? TM : 1][SWIGLU ? TN : 1];
 #pragma unroll
     for (int tm = 0; tm < TM; tm++) {
 #pragma unroll
       for (int tn = 0; tn < TN; tn++) {
-        inter[tn] = (bn + tn < KK) ? mat[tm * KK + bn + tn] : WT(0);
-      }
-#pragma unroll
-      for (int b = 0; b < B; b++) {
-#pragma unroll
-        for (int tn = 0; tn < TN; tn++) {
-          result[b][tm] += static_cast<float>(inter[tn]) * v_coeff[b][tn];
+        inter[tm][tn] = (bn + tn < KK) ? mat[size_t(tm) * KK + bn + tn] : WT(0);
+        if constexpr (SWIGLU) {
+          inter_up[tm][tn] = (bn + tn < KK) ? mat_up[size_t(tm) * KK + bn + tn] : WT(0);
         }
       }
-      if constexpr (SWIGLU) {
+    }
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+      float vc[TN];
+#pragma unroll
+      for (int tn = 0; tn < TN; tn++) {
+        vc[tn] = (bn + tn < KK) ? static_cast<float>(in_vec[b * KK + bn + tn]) : 0.0f;
+      }
+#pragma unroll
+      for (int tm = 0; tm < TM; tm++) {
 #pragma unroll
         for (int tn = 0; tn < TN; tn++) {
-          inter[tn] = (bn + tn < KK) ? mat_up[tm * KK + bn + tn] : WT(0);
-        }
-#pragma unroll
-        for (int b = 0; b < B; b++) {
-#pragma unroll
-          for (int tn = 0; tn < TN; tn++) {
-            result_up[b][tm] += static_cast<float>(inter[tn]) * v_coeff[b][tn];
+          result[b][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
+          if constexpr (SWIGLU) {
+            result_up[b][tm] += static_cast<float>(inter_up[tm][tn]) * vc[tn];
           }
         }
       }
@@ -226,15 +216,25 @@ METAL_FUNC void bailing_gemv_rows_run(
 )
 
 
-def _cfg(N: int, K: int):
-    """Exact block config MLX 0.32.4 picks for M == 1, weight stored (N, K)."""
+def _cfg(N: int, K: int, B: int = 1, is_swiglu: bool = False):
+    """Exact block config MLX 0.32.4 picks for M == 1, tuned TM/BM per B regime to avoid spills."""
     tm, tn, sm, sn, bm, bn = 4, 4, 1, 32, 1, 1
-    bm = _GEMV_BM_LARGE if N >= 4096 else 4
+    bm = (4 if B >= 14 else _GEMV_BM_LARGE) if N >= 4096 else 4
     sn = 32
     if K <= 64:
         bm, sm, sn = 1, 8, 4
     elif K >= 16 * N:
         bm, bn = 1, 8
+    if is_swiglu:
+        if B >= 5:
+            tm = 1
+    else:
+        if 5 <= B <= 12:
+            tm = 2
+        elif 13 <= B <= 16:
+            tm = 1
+        elif B > 16:
+            tm = 2
     tm = 1 if N < tm else tm
     return bm, bn, sm, sn, tm, tn
 
@@ -326,7 +326,7 @@ def gemv_rows_group(xs, ws):
     assert 1 <= B <= MAX_B
     assert all(x.shape == (B, K) and x.dtype == dt for x in xs)
     assert all(w.ndim == 2 and w.shape[1] == K and w.dtype == dt for w in ws)
-    cfgs = [_cfg(w.shape[0], K) for w in ws]
+    cfgs = [_cfg(w.shape[0], K, B, False) for w in ws]
     if len(set(cfgs)) > 1:
         out = [None] * len(ws)
         for c in dict.fromkeys(cfgs):
@@ -363,8 +363,8 @@ def gemv_rows_res(x, w, res):
     B, K = x.shape
     N = w.shape[0]
     dt = w.dtype
-    assert x.dtype == dt and res.shape == (B, N) and res.dtype == dt and w.shape[1] == K
-    cfg = _cfg(N, K)
+    assert 1 <= B <= MAX_B and x.dtype == dt and res.shape == (B, N) and res.dtype == dt and w.shape[1] == K
+    cfg = _cfg(N, K, B, False)
     kern, ntg = _build_group(dt, dt, dt, B, 1, [N], K, cfg, has_res=True)
     bm, bn, sm, sn, tm, tn = cfg
     return kern(
@@ -380,9 +380,9 @@ def gemv_swiglu_rows(x, w_gate, w_up):
     """Exact swiglu(x @ w_gate.T, x @ w_up.T) in one launch for (B, K) bf16."""
     B, K = x.shape
     N = w_gate.shape[0]
-    assert x.dtype == w_gate.dtype == w_up.dtype == mx.bfloat16
+    assert 1 <= B <= MAX_B and x.dtype == w_gate.dtype == w_up.dtype == mx.bfloat16
     assert w_up.shape == (N, K) and w_gate.shape[1] == K
-    cfg = _cfg(N, K)
+    cfg = _cfg(N, K, B, True)
     kern, ntg = _build_group(mx.bfloat16, mx.bfloat16, mx.bfloat16, B, 1, [N], K, cfg, is_swiglu=True)
     bm, bn, sm, sn, tm, tn = cfg
     return kern(
@@ -398,8 +398,8 @@ def router_gemv_rows(x_bf16, w_bf16):
     """Exact x.astype(float32) @ w.astype(float32).T reading bf16 weights directly."""
     B, K = x_bf16.shape
     N = w_bf16.shape[0]
-    assert x_bf16.dtype == mx.bfloat16 and w_bf16.dtype == mx.bfloat16 and w_bf16.shape[1] == K
-    cfg = _cfg(N, K)
+    assert 1 <= B <= MAX_B and x_bf16.dtype == mx.bfloat16 and w_bf16.dtype == mx.bfloat16 and w_bf16.shape[1] == K
+    cfg = _cfg(N, K, B, False)
     kern, ntg = _build_group(mx.float32, mx.bfloat16, mx.bfloat16, B, 1, [N], K, cfg)
     bm, bn, sm, sn, tm, tn = cfg
     return kern(

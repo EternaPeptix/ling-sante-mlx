@@ -44,3 +44,24 @@ See [docs/OPT_LOG.md](OPT_LOG.md) for the full optimization progression.
   * `run_eval.py gen`: `17.4 tok/s` across all 6 prompts; `run_eval.py ppl`: identical NLL `0.04473` / `0.04646` (`ppl 1.0458` / `1.0476`).
 * **Live server (`512S1:8080`, `mlx_lm.server --decode-concurrency 4 --prompt-concurrency 1`)**:
   * HTTP smoke test (`bench/http_smoke.py`, `max_tokens=128`, `temperature=0.0`): `C=1` end-to-end `14.28–14.90 tok/s` (`72–128` tok); `C=4` concurrent `423 tok in 11.13s` (`38.00 agg tok/s`), `exact_vs_C1=True`.
+
+## Bit-exact >= 80 tok/s native MTP Layer-72 speculative decoding & production serving
+See [docs/OPT_LOG.md](OPT_LOG.md) for the full multi-token kernel & speculative tuning log.
+* **Drafter choice (`512S1`, all `exact=True`, `0` diffs)**:
+  * Converted built-in **MTP Layer 72** (`tools/convert_mtp.py` -> `model-mtp.safetensors`, `4.2 GiB` / `4.520 GB`, draft-only 4-bit `q4_head`, `vendor/mlx_lm/models/bailing_moe_v3/mtp.py` & `spec_engine.py`) paired with multi-token target verification (`C*L <= 24`, `rows/*`, `verify_decode.py`, `LINGSANTE_VERIFY_FLUSH=4`).
+  * Benchmarked vs external `Ling-3.0-tiny-4bit`: native MTP clearly dominates (`spec_async_final.json`: `C=1 K=4 = 34.06 tok/s` / `256tok 35.17 tok/s`, `C=4 K=2 = 80.04 agg / 81.55 steady tok/s`, `256tok steady = 80.80 tok/s` vs `Ling-3.0-tiny-4bit` `C=1 = 22.75`, hybrid `25.99`, `C=4 = 43.22 agg tok/s`).
+* **Production `BatchGenerator` (`bench/batch_dec.py --C 1,2,3,4 --tokens 128 --reps 2 --mode batchgen`, `batchgen_mtp_final.json`, vs `baseline.json`)**:
+  * `C=1`: **`32.99 tok/s`** (`79.97 ms/step`, `329.7 GB`), `exact_tok=True`, `exact_lp32=True`
+  * `C=2`: **`56.61 tok/s`** (`28.31/stream`, `86.52 ms/step`, `330.9 GB`), `exact_tok=True`, `exact_lp32=True`
+  * `C=3`: **`70.64 tok/s`** (`23.55/stream`, `104.22 ms/step`, `332.0 GB`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=4`**: **`80.56 agg tok/s`** (`20.14/stream`, `120.54 ms/step`, **`332.9 GB`**), `exact_tok=True`, `exact_lp32=True`
+  * `LINGSANTE_MTP=0`: `C=1 = 17.38 tok/s`, `C=4 = 49.33 tok/s`, `exact_tok=True`, `exact_lp32=True` (zero regression).
+* **Production verification suite**:
+  * `bench/verify_kernels_test.py`: `SUMMARY: ALL PASS`.
+  * `bench/server_exact_test.py` (`LINGSANTE_MTP=1`, `1 -> 4 -> 2 -> 3 -> 1`): `SUMMARY: ALL PASS` (`exact_tok=True`, `exact_lp=True`).
+  * `bench/ctx_exact_test.py --ctx 2048 --tokens 32 --mtp`: `SUMMARY: ALL PASS` (`exact_tok=True`, `exact_lp=True`).
+  * Edge-case checks (`max_tokens=1/2`, multi-turn `deepcopy` cache resume, mid-flight `remove`, mixed `temp=0.7` + greedy, `stop_sequences`, `generate_step` early break): `EDGE_CASES_PASS`.
+  * `tools/run_eval.py gen`: `32.1–38.8 tok/s` across all 6 prompts; `tools/run_eval.py ppl`: `chunk 64 mean NLL 0.04473 (ppl 1.0458)`, `chunk 512 mean NLL 0.04646 (ppl 1.0476)`.
+* **Live server (`512S1:8080`, `mlx_lm.server --decode-concurrency 4 --prompt-concurrency 1`, `LINGSANTE_MTP=1`)**:
+  * `bench/http_smoke.py --max-tokens 128`: `C=1`: `23.33–33.45 tok/s`; `C=4` concurrent: `423 tok in 6.45s` (**`65.58 agg tok/s`**), `exact_vs_C1=True`.
+  * `bench/http_smoke.py --max-tokens 256`: `C=1`: `26.58–36.70 tok/s`; `C=4` concurrent: `517 tok in 8.73s` (**`59.22 agg tok/s`**), `exact_vs_C1=True`.

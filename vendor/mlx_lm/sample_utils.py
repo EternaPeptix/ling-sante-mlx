@@ -70,6 +70,7 @@ def make_sampler(
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
 
+    sampler._is_greedy = False
     return sampler
 
 
@@ -132,6 +133,9 @@ def make_logits_processors(
 
 def greedy_sampler(logprobs: mx.array) -> mx.array:
     return mx.argmax(logprobs, axis=-1)
+
+
+greedy_sampler._is_greedy = True
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)

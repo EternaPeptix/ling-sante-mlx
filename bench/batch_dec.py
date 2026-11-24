@@ -179,17 +179,19 @@ def run_batchgen(model, tok, refs, C: int, n_tokens: int):
             break
         if not resps:
             continue
+        step_uids = set()
         for r in resps:
             idx = uid_to_idx[r.uid]
+            step_uids.add(idx)
             if len(lp_digs[idx]) < 32:
                 lp_digs[idx].append(lp_digest(r.logprobs))
             streams[idx].append(int(r.token))
             total_gen += 1
         if first_decode_t is None:
-            if len(resps) == C:
+            if len(step_uids) == C:
                 first_decode_t = time.perf_counter()
-        elif len(resps) == C:
-            steady_gen += C
+        elif len(step_uids) == C:
+            steady_gen += len(resps)
             steady_steps += 1
             last_steady_t = time.perf_counter()
     dt_total = time.perf_counter() - t_start

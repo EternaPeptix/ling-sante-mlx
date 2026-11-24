@@ -614,6 +614,10 @@ def load_model(
 
     if not lazy:
         mx.eval(model.parameters())
+        if "bailing_moe_v3" in type(model).__module__:
+            from .models.bailing_moe_v3.spec_engine import attach_lingsante_mtp
+
+            attach_lingsante_mtp(model, model_path)
 
     return model, config
 

@@ -87,11 +87,10 @@ _GATE_SRC = r"""
 
 _ML_SRC = r"""
     // Multi-head batched GEMV: out[b, h, 0, n] = x[b, h, 0, :] @ w[h, n, :].T
-    // Uses exact MLX (bm=4, bn=1, sm=1, sn=32, tm=4, tn=4) K-reduction order.
+    // Uses exact MLX (bm=4, bn=1, sm=1, sn=32, tm=TM, tn=4) K-reduction order.
     constexpr int BM = 4;
-    constexpr int TM = 4;
     constexpr int TN = 4;
-    constexpr int blockM = BM * TM;  // 16
+    constexpr int blockM = BM * TM;
     constexpr int blockN = 32 * TN;  // 128
 
     const uint lane = thread_index_in_simdgroup;
@@ -113,24 +112,24 @@ _ML_SRC = r"""
 
     constexpr int n_iter = KK / blockN;
     for (int i = 0; i < n_iter; ++i) {
-      float vc[BB][TN];
-#pragma unroll
-      for (int b = 0; b < BB; ++b) {
-        const device ushort* px = (const device ushort*)(x + (size_t(b) * NH + h) * KK + bn);
-#pragma unroll
-        for (int tn = 0; tn < 4; ++tn) vc[b][tn] = static_cast<float>(as_type<bfloat16_t>(px[tn]));
-      }
+      T inter[TM][4];
 #pragma unroll
       for (int tm = 0; tm < TM; ++tm) {
         const device ushort* pw = (const device ushort*)(mat + size_t(tm) * KK + bn);
-        T inter[4];
 #pragma unroll
-        for (int tn = 0; tn < 4; ++tn) inter[tn] = as_type<bfloat16_t>(pw[tn]);
+        for (int tn = 0; tn < 4; ++tn) inter[tm][tn] = as_type<bfloat16_t>(pw[tn]);
+      }
 #pragma unroll
-        for (int b = 0; b < BB; ++b)
+      for (int b = 0; b < BB; ++b) {
+        float vc[TN];
+        const device ushort* px = (const device ushort*)(x + (size_t(b) * NH + h) * KK + bn);
+#pragma unroll
+        for (int tn = 0; tn < 4; ++tn) vc[tn] = static_cast<float>(as_type<bfloat16_t>(px[tn]));
+#pragma unroll
+        for (int tm = 0; tm < TM; ++tm)
 #pragma unroll
           for (int tn = 0; tn < 4; ++tn)
-            res[b][tm] += static_cast<float>(inter[tn]) * vc[b][tn];
+            res[b][tm] += static_cast<float>(inter[tm][tn]) * vc[tn];
       }
       bn += blockN;
     }
@@ -209,13 +208,14 @@ def mla_multilinear_rows(x: mx.array, w: mx.array, g_raw: mx.array | None = None
     """Weights-read-once MultiLinear for (B, H, 1, K) @ (H, N, K).T, optional fused head gate."""
     B, H, L, K = x.shape
     N = w.shape[1]
-    assert L == 1 and 1 <= B <= 4 and w.shape == (H, N, K) and K % 128 == 0 and N % 16 == 0
+    assert L == 1 and 1 <= B <= 24 and w.shape == (H, N, K) and K % 128 == 0 and N % 8 == 0
     has_gate = g_raw is not None
     gr = g_raw if has_gate else mx.zeros((1,), dtype=x.dtype)
-    nt = N // 16
+    tm = 4 if B <= 12 else 2
+    nt = N // (4 * tm)
     (out,) = _ml_kernel()(
         inputs=[x, w, gr],
-        template=[("T", x.dtype), ("BB", B), ("NH", H), ("NN", N), ("KK", K), ("HAS_GATE", int(has_gate))],
+        template=[("T", x.dtype), ("BB", B), ("NH", H), ("NN", N), ("KK", K), ("TM", tm), ("HAS_GATE", int(has_gate))],
         grid=(nt * 32, 4, H),
         threadgroup=(32, 4, 1),
         output_shapes=[(B, N * H) if has_gate else (B, H, 1, N)],
@@ -336,5 +336,128 @@ def mla_layer_rows(h_in: mx.array, res: mx.array, attn, cache):
     kl_all, kr_all = cache.update_and_fetch(kv_latent, k_rope)
     starts = _get_left_starts(cache, B)
     out = mla_sdpa_rows(q_nope, q_rope, kl_all, kr_all, attn.scale, starts)
+    gated = mla_multilinear_rows(out, attn.unembed_out.weight, g_raw=g_raw)
+    return gemv_rows_res(gated, attn.dense.weight, res)
+
+
+def _mla_verify_proj_prep(h_in: mx.array, attn, offsets: mx.array):
+    q_a, kv_a_full, g_raw = gemv_rows_multi(
+        h_in, [attn.q_a_proj.weight, attn.kv_a_proj_with_mqa.weight, attn.g_proj.weight]
+    )
+    q_a_norm = mx.fast.rms_norm(q_a, attn.q_a_layernorm.weight, attn.q_a_layernorm.eps)
+    q_full = gemv_rows(q_a_norm, attn.q_b_proj.weight)
+    q_nope, q_rope, kv_latent, k_rope = mla_prep_kv_rope_rows(
+        q_full,
+        kv_a_full,
+        attn.kv_a_layernorm.weight,
+        offsets,
+        kv_eps=attn.kv_a_layernorm.eps,
+        base=float(getattr(attn.rope, "base", 6000000.0)),
+        scale=float(getattr(attn.rope, "scale", 1.0)),
+    )
+    q_nope = mla_multilinear_rows(q_nope, attn.embed_q.weight)
+    return q_nope, q_rope, kv_latent, k_rope, g_raw
+
+
+def _mla_append_causal_slice(
+    outs: list,
+    kl_buf: mx.array,
+    kr_buf: mx.array,
+    q_nope: mx.array,
+    q_rope: mx.array,
+    start_b: int,
+    start_k: int,
+    base_end: int,
+    lc: int,
+    scale: float,
+):
+    for t in range(lc):
+        b = start_b + t
+        end = base_end + t + 1
+        kl_t = kl_buf[:, :, start_k:end, :]
+        kr_t = kr_buf[:, :, start_k:end, :]
+        pe = (q_rope[b : b + 1] * scale) @ kr_t.swapaxes(-1, -2)
+        sc = (q_nope[b : b + 1] * scale) @ kl_t.swapaxes(-1, -2) + pe
+        pr = mx.softmax(sc, axis=-1, precise=True)
+        outs.append(pr @ kl_t)
+
+
+def mla_verify_layer_rows(h_in: mx.array, res: mx.array, attn, cache, *, C: int, L: int):
+    """Bit-exact causal multi-token (C * L <= 24) BailingMLA layer supporting KVCache, list[KVCache], BatchKVCache."""
+    B = C * L
+    assert h_in.shape[0] == B and 1 <= B <= 24
+
+    if isinstance(cache, list):
+        assert len(cache) == C
+        offs_before = [int(c_i.offset) for c_i in cache]
+        offsets = mx.array([o + t for o in offs_before for t in range(L)], dtype=mx.int32)
+    elif hasattr(cache, "left_padding"):
+        offsets = (cache.offset[:, None] + mx.arange(L, dtype=mx.int32)[None, :]).reshape(-1)
+    else:
+        assert C == 1
+        off0 = int(cache.offset)
+        offsets = mx.arange(off0, off0 + L, dtype=mx.int32)
+
+    q_nope, q_rope, kv_latent, k_rope, g_raw = _mla_verify_proj_prep(h_in, attn, offsets)
+
+    kl_in = kv_latent.reshape(C, 1, L, 512)
+    kr_in = k_rope.reshape(C, 1, L, 64)
+    scale = attn.scale
+    outs = []
+
+    if isinstance(cache, list):
+        for c in range(C):
+            off_c = offs_before[c]
+            kl_c, kr_c = cache[c].update_and_fetch(kl_in[c : c + 1], kr_in[c : c + 1])
+            _mla_append_causal_slice(outs, kl_c, kr_c, q_nope, q_rope, c * L, 0, off_c, L, scale)
+    elif hasattr(cache, "left_padding"):
+        starts = _get_left_starts(cache, C)
+        kl_all, kr_all = cache.update_and_fetch(kl_in, kr_in)
+        base_end = kl_all.shape[2] - L
+        for c in range(C):
+            _mla_append_causal_slice(
+                outs,
+                kl_all[c : c + 1],
+                kr_all[c : c + 1],
+                q_nope,
+                q_rope,
+                c * L,
+                starts[c],
+                base_end,
+                L,
+                scale,
+            )
+    else:
+        kl_all, kr_all = cache.update_and_fetch(kl_in, kr_in)
+        _mla_append_causal_slice(outs, kl_all, kr_all, q_nope, q_rope, 0, 0, off0, L, scale)
+
+    out = mx.concatenate(outs, axis=0)
+    gated = mla_multilinear_rows(out, attn.unembed_out.weight, g_raw=g_raw)
+    return gemv_rows_res(gated, attn.dense.weight, res)
+
+
+def mla_verify_varlen_rows(h_in: mx.array, res: mx.array, attn, caches: list, Ls: list[int]):
+    """Bit-exact variable-length causal (sum(Ls) <= 24) BailingMLA layer over unpadded `list[KVCache]`."""
+    C = len(Ls)
+    B = sum(Ls)
+    assert isinstance(caches, list) and len(caches) == C and 1 <= B <= 24 and h_in.shape[0] == B
+    assert all(lc >= 1 for lc in Ls)
+
+    offs_before = [int(c_i.offset) for c_i in caches]
+    offsets = mx.array([offs_before[c] + t for c in range(C) for t in range(Ls[c])], dtype=mx.int32)
+    q_nope, q_rope, kv_latent, k_rope, g_raw = _mla_verify_proj_prep(h_in, attn, offsets)
+
+    scale = attn.scale
+    outs = []
+    pos = 0
+    for c, lc in enumerate(Ls):
+        kl_c, kr_c = caches[c].update_and_fetch(
+            kv_latent[pos : pos + lc].reshape(1, 1, lc, 512),
+            k_rope[pos : pos + lc].reshape(1, 1, lc, 64),
+        )
+        _mla_append_causal_slice(outs, kl_c, kr_c, q_nope, q_rope, pos, 0, offs_before[c], lc, scale)
+        pos += lc
+
+    out = mx.concatenate(outs, axis=0)
     gated = mla_multilinear_rows(out, attn.unembed_out.weight, g_raw=g_raw)
     return gemv_rows_res(gated, attn.dense.weight, res)
