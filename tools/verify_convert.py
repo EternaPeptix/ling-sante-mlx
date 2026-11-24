@@ -5,8 +5,11 @@
  * FP8 linears: stored bf16 vs bf16(source fp8 * scale) -> bit-identical.
  * pass-through tensors (bf16/f32): bit-identical.
 
-usage: verify_convert.py SRC DST [n_samples]
+usage: verify_convert.py SRC DST [n_samples] [--cpu]
 """
+import argparse
+import glob
+import os
 import random
 import sys
 
@@ -19,33 +22,46 @@ _here = __file__.rsplit("/", 1)[0]
 sys.path[:0] = [_here, _here + "/../vendor"]
 from ref_layer import Src  # noqa: E402
 
-src = Src(sys.argv[1])
-dst = sys.argv[2]
-n = int(sys.argv[3]) if len(sys.argv) > 3 else 24
+ap = argparse.ArgumentParser()
+ap.add_argument("src")
+ap.add_argument("dst")
+ap.add_argument("n_samples", nargs="?", type=int, default=24)
+ap.add_argument("--cpu", action="store_true")
+args = ap.parse_args()
+if args.cpu:
+    mx.set_default_device(mx.cpu)
+
+src = Src(args.src)
+dst = args.dst
+n = args.n_samples
 random.seed(0)
-import glob
 
 files = sorted(glob.glob(f"{dst}/model-layer-*.safetensors"))
-print("converted layer files:", len(files))
+misc_file = f"{dst}/model-misc.safetensors"
+if os.path.exists(misc_file):
+    files = files + [misc_file]
+print("converted files:", len(files))
 bad = 0
 cnt = {"expert": 0, "fp8": 0, "copy": 0}
 for f in files:
-    li = int(f.rsplit("-", 1)[1].split(".")[0])
+    is_misc = f.endswith("model-misc.safetensors")
     w = mx.load(f)
-    pre = f"model.layers.{li}"
-    if f"{pre}.mlp.switch_mlp.gate_proj.weight" in w:
-        for _ in range(n):
-            e = random.randrange(src.cfg["num_experts"])
-            proj = random.choice(["gate_proj", "up_proj", "down_proj"])
-            W = w[f"{pre}.mlp.switch_mlp.{proj}.weight"][e]
-            S = w[f"{pre}.mlp.switch_mlp.{proj}.scales"][e]
-            got = np.array(mx.dequantize(W, S, group_size=32, bits=4, mode="mxfp4", dtype=mx.float32))
-            ref = src.fp4(f"{pre}.mlp.experts.{e}.{proj}.weight").numpy()
-            same = np.array_equal(got.view(np.uint32), ref.view(np.uint32)) or np.array_equal(got, ref)
-            cnt["expert"] += 1
-            if not same:
-                bad += 1
-                print("EXPERT MISMATCH", li, e, proj, float(np.abs(got - ref).max()))
+    if not is_misc:
+        li = int(f.rsplit("-", 1)[1].split(".")[0])
+        pre = f"model.layers.{li}"
+        if f"{pre}.mlp.switch_mlp.gate_proj.weight" in w:
+            for _ in range(n):
+                e = random.randrange(src.cfg["num_experts"])
+                proj = random.choice(["gate_proj", "up_proj", "down_proj"])
+                W = w[f"{pre}.mlp.switch_mlp.{proj}.weight"][e]
+                S = w[f"{pre}.mlp.switch_mlp.{proj}.scales"][e]
+                got = np.array(mx.dequantize(W, S, group_size=32, bits=4, mode="mxfp4", dtype=mx.float32))
+                ref = src.fp4(f"{pre}.mlp.experts.{e}.{proj}.weight").numpy()
+                same = np.array_equal(got.view(np.uint32), ref.view(np.uint32)) or np.array_equal(got, ref)
+                cnt["expert"] += 1
+                if not same:
+                    bad += 1
+                    print("EXPERT MISMATCH", li, e, proj, float(np.abs(got - ref).max()))
     for k, v in w.items():
         if ".switch_mlp." in k or k.endswith((".scales", ".biases")):
             continue

@@ -1,10 +1,24 @@
 #!/bin/zsh
-# usage: [LANE=name] scripts/r <cmd...>   sync this repo to 512S2:~/science/src-<lane>, run <cmd> there in ~/science/.venv.
+# usage: [LANE=name] [RHOST=512S1|512S2] scripts/r [--gpu] <cmd...>   sync this repo to HOST:~/science/src-<lane>, run <cmd> there in ~/science/.venv.
 if [ -z "${ZSH_VERSION:-}" ]; then echo "scripts/r must run under zsh; refusing" >&2; exit 2; fi
 set -e
 root=${0:A:h:h}
 [[ -n $root && -f $root/docs/OBJECTIVES.md && -d $root/vendor/mlx_lm ]] || { echo "bad repo root '$root'; refusing" >&2; exit 2; }
+gpu=0; [ "$1" = --gpu ] && { gpu=1; shift; }
 lane=${LANE:-main}
-sshc=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostName=100.123.125.48 -o HostKeyAlias=512s2.local)
-rsync -a --delete -e "${sshc[*]}" --exclude .git --exclude .claude --exclude '__pycache__' "$root/" "512S2:science/src-$lane/"
-"${sshc[@]}" 512S2 "cd ~/science/src-$lane && export PYTHONPATH=\$PWD/vendor:\$PWD HF_HUB_OFFLINE=1 PATH=~/science/.venv/bin:\$PATH && $*"
+host=${RHOST:-512S1}
+case $host in
+  512S1)
+    sshc=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostName=100.116.244.105 -o HostKeyAlias=512s1.local)
+    lock=~/science/gpu.lock
+    ;;
+  512S2)
+    sshc=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostName=100.123.125.48 -o HostKeyAlias=512s2.local)
+    lock=~/loopling-opt/gpu.lock
+    ;;
+  *) echo "RHOST must be 512S1 or 512S2" >&2; exit 2;;
+esac
+rsync -a --delete -e "${sshc[*]}" --exclude .git --exclude .claude --exclude /runs --exclude '__pycache__' "$root/" "${host}:science/src-${lane}/"
+pre="cd ~/science/src-$lane && export PYTHONPATH=\$PWD/vendor:\$PWD HF_HUB_OFFLINE=1 PATH=~/science/.venv/bin:\$PATH"
+if [ $gpu = 1 ]; then "${sshc[@]}" $host "$pre && /usr/bin/lockf -k $lock zsh -c ${(q)*}"
+else "${sshc[@]}" $host "$pre && $*"; fi

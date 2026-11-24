@@ -17,3 +17,13 @@ Run order once ~/science/dl.log has DONE (all via LANE=port scripts/r):
 fp32 compute, bf16-rounded reference weights, full-layer relL2: L0 3.8e-6, L1 1.2e-5, L4 8.3e-5, L7 2.3e-6; MoE block 1.4e-6/1.5e-6; router top-k agreement 1.000; cache path identical.
 bf16 compute vs true fp32: L0 4.7e-3, L1 7.5e-3, L4 1.2e-1 (2/48 tokens flip a router expert), L7 2.8e-2.
 Experts: 48 sampled bit-identical. Nibble order confirmed only self-consistently; generation sanity pending.
+
+## Full 72-layer conversion, verification, and stock baseline on 512S1 (M3 Ultra, 512 GB)
+* Conversion (`tools/convert.py --cpu` on 512S2, transferred via 80 Gbps Thunderbolt 5 to `512S1:~/science/models/lingsante-mlx-mxfp4-bf16`): `301 GiB` (`73` safetensors files, `1798` tensors).
+* Verification (`tools/verify_convert.py ... 24 --cpu`): `checked {'expert': 1632, 'fp8': 639, 'copy': 751} mismatches 0`.
+* `run_eval.py gen`: all 6 greedy medical, chemistry, and biology prompts fluent and domain-accurate (`14.3–14.4 tok/s`, loaded in `50s` cold / `30s` warm, `323.6 GB` active memory).
+* `run_eval.py ppl` (`passage.txt`, `1239` tokens): chunk 64 mean NLL `0.04473` (`ppl 1.0458`), chunk 512 mean NLL `0.04646` (`ppl 1.0476`), `ppl ratio chunk64/chunk512 = 0.99828`.
+* `run_eval.py bench --long`:
+  * Decode (`256` greedy tokens, prompt `81` tok): `14.36 tok/s`, prompt `42.2 tok/s`, peak `324.3 GB`.
+  * Prefill `2048` tokens (`step=2048`): `6.5s = 317.4 tok/s`, peak `331.6 GB`.
+  * Prefill `32768` tokens (`step=2048`): `117.5s = 278.8 tok/s`, peak `340.8 GB`.

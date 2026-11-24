@@ -170,7 +170,10 @@ def main():
     ap.add_argument("--linears", default="bf16", choices=["bf16", "q8"])
     ap.add_argument("--layers", default=None, help="a:b half-open range of layers (default all)")
     ap.add_argument("--no-misc", action="store_true")
+    ap.add_argument("--cpu", action="store_true", help="run MLX ops on CPU (avoid touching GPU)")
     a = ap.parse_args()
+    if a.cpu:
+        mx.set_default_device(mx.cpu)
     src_dir, dst = Path(a.src), Path(a.dst)
     cfg = json.loads((src_dir / "config.json").read_text())
     dst.mkdir(parents=True, exist_ok=True)
