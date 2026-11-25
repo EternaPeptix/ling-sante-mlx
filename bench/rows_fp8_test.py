@@ -458,11 +458,109 @@ def sweep_b(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head):
         print(f"    lm_head(bf16)   : " + " ".join(f"{lb}" for _, lb in res_lh[:4]), flush=True)
 
 
+def bench_cold_multilayer():
+    """Cold multi-layer (>=16L / >=2.7 GB, wired) DRAM GB/s benchmark across B = 1, 5, 8, 12."""
+    info = mx.device_info()
+    max_ws = int(info.get("max_recommended_working_set_size", 0))
+    if max_ws > 0:
+        mx.set_wired_limit(max_ws)
+    print(f"\n=== Cold Multi-Layer DRAM Benchmark (wired={max_ws/1e9:.1f} GB) ===", flush=True)
+
+    def _run_cold(fn, total_bytes, nlayers, reps=5):
+        out = fn()
+        mx.eval(*out) if isinstance(out, (list, tuple)) else mx.eval(out)
+        mx.synchronize()
+        dts = []
+        for _ in range(reps):
+            t0 = time.perf_counter()
+            out = fn()
+            mx.eval(*out) if isinstance(out, (list, tuple)) else mx.eval(out)
+            dts.append(time.perf_counter() - t0)
+        dt = statistics.median(dts)
+        return dt * 1e6 / nlayers, (total_bytes / 1e9) / dt
+
+    mx.random.seed(7)
+    NL, NL_SM = 16, 32
+    qkv_w = [[mx.random.randint(0, 120, (8192, 4096), dtype=mx.uint8) for _ in range(5)] for _ in range(NL)]
+    qkv_s = [[mx.full((64, 32), 0.01, dtype=mx.float32) for _ in range(5)] for _ in range(NL)]
+    b_w = [mx.random.normal((64, 4096)).astype(mx.bfloat16) for _ in range(NL)]
+    qkv_m_w = [mx.concatenate(qkv_w[i], axis=0) for i in range(NL)]
+    qkv_m_s = [mx.concatenate(qkv_s[i], axis=0) for i in range(NL)]
+    op_w = [mx.random.randint(0, 120, (4096, 8192), dtype=mx.uint8) for _ in range(NL)]
+    op_s = [mx.full((32, 64), 0.01, dtype=mx.float32) for _ in range(NL)]
+    dsw_g = [mx.random.randint(0, 120, (10240, 4096), dtype=mx.uint8) for _ in range(NL)]
+    dsw_u = [mx.random.randint(0, 120, (10240, 4096), dtype=mx.uint8) for _ in range(NL)]
+    dsw_sg = [mx.full((80, 32), 0.01, dtype=mx.float32) for _ in range(NL)]
+    dsw_su = [mx.full((80, 32), 0.01, dtype=mx.float32) for _ in range(NL)]
+    ddn_w = [mx.random.randint(0, 120, (4096, 10240), dtype=mx.uint8) for _ in range(NL)]
+    ddn_s = [mx.full((32, 80), 0.01, dtype=mx.float32) for _ in range(NL)]
+    rtr_w = [mx.random.normal((512, 4096)).astype(mx.bfloat16) for _ in range(NL_SM)]
+    sesw_g = [mx.random.randint(0, 120, (1280, 4096), dtype=mx.uint8) for _ in range(NL_SM)]
+    sesw_u = [mx.random.randint(0, 120, (1280, 4096), dtype=mx.uint8) for _ in range(NL_SM)]
+    sesw_sg = [mx.full((10, 32), 0.01, dtype=mx.float32) for _ in range(NL_SM)]
+    sesw_su = [mx.full((10, 32), 0.01, dtype=mx.float32) for _ in range(NL_SM)]
+    sedn_w = [mx.random.randint(0, 120, (4096, 1280), dtype=mx.uint8) for _ in range(NL_SM)]
+    sedn_s = [mx.full((32, 10), 0.01, dtype=mx.float32) for _ in range(NL_SM)]
+    lh_w = [mx.random.normal((157184, 4096)).astype(mx.bfloat16) for _ in range(2)]
+    mx.eval(
+        *[w for lw in qkv_w for w in lw], *[s for ls in qkv_s for s in ls], *b_w,
+        *qkv_m_w, *qkv_m_s, *op_w, *op_s,
+        *dsw_g, *dsw_u, *dsw_sg, *dsw_su, *ddn_w, *ddn_s,
+        *rtr_w, *sesw_g, *sesw_u, *sesw_sg, *sesw_su, *sedn_w, *sedn_s, *lh_w,
+    )
+    mx.synchronize()
+
+    class _FakeMod:
+        def __init__(self, w, s):
+            self.weight_fp8 = w
+            self.weight_scale_inv = s
+
+    se_g = [_FakeMod(sesw_g[i], sesw_sg[i]) for i in range(NL_SM)]
+    se_u = [_FakeMod(sesw_u[i], sesw_su[i]) for i in range(NL_SM)]
+    B_QKVB = 5 * 8192 * 4096 + 64 * 4096 * 2
+    B_OP = 4096 * 8192
+    B_DSW = 2 * 10240 * 4096
+    B_DDN = 4096 * 10240
+    B_RS = 512 * 4096 * 2 + 2 * 1280 * 4096
+    B_SD = 4096 * 1280
+    B_LH = 157184 * 4096 * 2
+
+    for B in (1, 5, 8, 12):
+        x4 = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+        x8 = (mx.random.normal((B, 8192)) * 0.25).astype(mx.bfloat16)
+        xd = (mx.random.normal((B, 10240)) * 0.25).astype(mx.bfloat16)
+        xs = (mx.random.normal((B, 1280)) * 0.25).astype(mx.bfloat16)
+        mx.eval(x4, x8, xd, xs)
+        u_qb, g_qb = _run_cold(lambda: [o for i in range(NL) for o in gemv_fp8_with_bf16_tail_rows(x4, qkv_w[i], qkv_s[i], b_w[i])], NL * B_QKVB, NL)
+        u_qm, g_qm = _run_cold(lambda: [o for i in range(NL) for o in gemv_kda_qkvfgb_merged_rows(x4, qkv_m_w[i], qkv_m_s[i], b_w[i])], NL * B_QKVB, NL)
+        u_op, g_op = _run_cold(lambda: [gemv_fp8_rows_res(x8, op_w[i], op_s[i], x4) for i in range(NL)], NL * B_OP, NL)
+        u_dsw, g_dsw = _run_cold(lambda: [gemv_fp8_swiglu_rows(x4, dsw_g[i], dsw_sg[i], dsw_u[i], dsw_su[i]) for i in range(NL)], NL * B_DSW, NL)
+        u_ddn, g_ddn = _run_cold(lambda: [gemv_fp8_rows_res(xd, ddn_w[i], ddn_s[i], x4) for i in range(NL)], NL * B_DDN, NL)
+        u_rs, g_rs = _run_cold(lambda: [o for i in range(NL_SM) for o in gemv_router_se_swiglu_rows(x4, rtr_w[i], se_g[i], se_u[i])], NL_SM * B_RS, NL_SM)
+        u_sd, g_sd = _run_cold(lambda: [gemv_fp8_rows(xs, sedn_w[i], sedn_s[i]) for i in range(NL_SM)], NL_SM * B_SD, NL_SM)
+        u_lh, g_lh = _run_cold(lambda: [gemv_rows(x4, lh_w[i]) for i in range(2)], 2 * B_LH, 2)
+        print(
+            f"B={B:2d}: qkvfg+b={u_qb:5.1f}us/{g_qb:5.1f}G (x63={u_qb*63/1e3:5.2f}ms) | "
+            f"mrg={u_qm:5.1f}us/{g_qm:5.1f}G (x63={u_qm*63/1e3:5.2f}ms) | "
+            f"o_proj={u_op:4.1f}us/{g_op:5.1f}G (x63={u_op*63/1e3:4.2f}ms) | "
+            f"denSw={u_dsw:5.1f}us/{g_dsw:5.1f}G | denDn={u_ddn:4.1f}us/{g_ddn:5.1f}G | "
+            f"rtr+seSw={u_rs:4.1f}us/{g_rs:5.1f}G (x68={u_rs*68/1e3:4.2f}ms) | "
+            f"se_dn={u_sd:4.1f}us/{g_sd:5.1f}G (x68={u_sd*68/1e3:4.2f}ms) | "
+            f"lm_head={u_lh:5.0f}us/{g_lh:5.1f}G",
+            flush=True,
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep-b", action="store_true")
     ap.add_argument("--skip-exact", action="store_true")
+    ap.add_argument("--cold", action="store_true")
     a = ap.parse_args()
+
+    if a.cold:
+        bench_cold_multilayer()
+        return 0
 
     l0_bf, _ = load_layer(0, use_fp8=False)
     l4_bf, _ = load_layer(4, use_fp8=False)
