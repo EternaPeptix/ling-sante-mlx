@@ -11,12 +11,12 @@ from pathlib import Path
 _here = Path(__file__).resolve().parent
 sys.path[:0] = [str(_here), str(_here.parent / "vendor")]
 
-import mlx.core as mx  # noqa: E402
-import mlx.nn as nn  # noqa: E402
-import numpy as np  # noqa: E402
 from mlx_lm import load, stream_generate  # noqa: E402
 from mlx_lm.models.cache import make_prompt_cache  # noqa: E402
 from mlx_lm.sample_utils import make_sampler  # noqa: E402
+import mlx.core as mx  # noqa: E402
+import mlx.nn as nn  # noqa: E402
+import numpy as np  # noqa: E402
 
 PROMPTS = [
     ("medical", "A 58-year-old man presents with crushing substernal chest pain radiating to the left arm, diaphoresis, and ST elevation in leads II, III and aVF. What is the most likely diagnosis, which coronary artery is probably involved, and what are the first three management steps?"),
