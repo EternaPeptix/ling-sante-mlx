@@ -347,7 +347,27 @@ class BailingSparseMoE(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         indices, scores = self.gate(x)
-        routed = self.switch_mlp(x, indices)
+        sw = self.switch_mlp
+        if hasattr(sw, "_gu_packed"):
+            from .rows.moe import unpack_moe_dn_weights, unpack_moe_gu_weights
+
+            wg, scg, wu, scu = unpack_moe_gu_weights(sw._gu_packed)
+            wd, scd = unpack_moe_dn_weights(sw._dn_packed)
+            sw.gate_proj.weight, sw.gate_proj.scales = wg, scg
+            sw.up_proj.weight, sw.up_proj.scales = wu, scu
+            sw.down_proj.weight, sw.down_proj.scales = wd, scd
+            try:
+                routed = sw(x, indices)
+                mx.eval(routed)
+            finally:
+                sw.gate_proj.weight = None
+                sw.gate_proj.scales = None
+                sw.up_proj.weight = None
+                sw.up_proj.scales = None
+                sw.down_proj.weight = None
+                sw.down_proj.scales = None
+        else:
+            routed = sw(x, indices)
         routed = (routed * scores[..., None]).sum(axis=-2).astype(x.dtype)
         return routed + self.shared_experts(x)
 

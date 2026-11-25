@@ -39,7 +39,9 @@ from mlx_lm.models.bailing_moe_v3.rows.kda import (  # noqa: E402
 )
 from mlx_lm.models.bailing_moe_v3.rows.mla import mla_verify_layer_rows  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.moe import (  # noqa: E402
+    moe_down_combine_packed_rows,
     moe_down_combine_rows,
+    moe_gate_up_swiglu_packed_rows,
     moe_gate_up_swiglu_rows,
 )
 from mlx_lm.models.bailing_moe_v3.rows.router import group_router_dedup_rows, group_router_rows  # noqa: E402
@@ -278,13 +280,20 @@ def _capture_all_layers(model, inp: mx.array, vcache, C: int, L: int):
                 )
                 dedup = None
             sw = mlp.switch_mlp
-            h_mid = moe_gate_up_swiglu_rows(
-                mlp_in, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dedup
-            )
-            sh = gemv_lin(se_mid, se.down_proj)
-            x = moe_down_combine_rows(
-                h_mid, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=h_post, dedup=dedup
-            )
+            if hasattr(sw, "_gu_packed"):
+                h_mid = moe_gate_up_swiglu_packed_rows(mlp_in, sw._gu_packed, inds, dedup=dedup)
+                sh = gemv_lin(se_mid, se.down_proj)
+                x = moe_down_combine_packed_rows(
+                    h_mid, sw._dn_packed, inds, wts, shared=sh, residual=h_post, dedup=dedup
+                )
+            else:
+                h_mid = moe_gate_up_swiglu_rows(
+                    mlp_in, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dedup
+                )
+                sh = gemv_lin(se_mid, se.down_proj)
+                x = moe_down_combine_rows(
+                    h_mid, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=h_post, dedup=dedup
+                )
             mx.eval(x, inds)
             uniq_counts.append(len(set(inds.reshape(-1).tolist())))
             rec.update({"logits_r": logits_r, "se_mid": se_mid, "inds": inds, "wts": wts,
@@ -536,10 +545,13 @@ def measure_regime_ledger(model, mtp, tok, C: int, L: int) -> dict:
         for i in moe_idx:
             sw = layers[i].mlp.switch_mlp
             r = acts[i]
-            outs.append(moe_gate_up_swiglu_rows(
-                r["mlp_in"], sw.gate_proj.weight, sw.gate_proj.scales,
-                sw.up_proj.weight, sw.up_proj.scales, r["inds"], dedup=r["dedup"],
-            ))
+            if hasattr(sw, "_gu_packed"):
+                outs.append(moe_gate_up_swiglu_packed_rows(r["mlp_in"], sw._gu_packed, r["inds"], dedup=r["dedup"]))
+            else:
+                outs.append(moe_gate_up_swiglu_rows(
+                    r["mlp_in"], sw.gate_proj.weight, sw.gate_proj.scales,
+                    sw.up_proj.weight, sw.up_proj.scales, r["inds"], dedup=r["dedup"],
+                ))
         return outs
 
     # MXFP4: 0.5 B/elem weights + 1/32 B/elem scales = 17/32 = 0.53125 B/elem
@@ -552,10 +564,16 @@ def measure_regime_ledger(model, mtp, tok, C: int, L: int) -> dict:
         for i in moe_idx:
             sw = layers[i].mlp.switch_mlp
             r = acts[i]
-            outs.append(moe_down_combine_rows(
-                r["h_mid"], sw.down_proj.weight, sw.down_proj.scales,
-                r["inds"], r["wts"], shared=r["sh"], residual=r["h_post"], dedup=r["dedup"],
-            ))
+            if hasattr(sw, "_dn_packed"):
+                outs.append(moe_down_combine_packed_rows(
+                    r["h_mid"], sw._dn_packed, r["inds"], r["wts"],
+                    shared=r["sh"], residual=r["h_post"], dedup=r["dedup"],
+                ))
+            else:
+                outs.append(moe_down_combine_rows(
+                    r["h_mid"], sw.down_proj.weight, sw.down_proj.scales,
+                    r["inds"], r["wts"], shared=r["sh"], residual=r["h_post"], dedup=r["dedup"],
+                ))
         return outs
 
     bytes_moe_dc = int(total_u * 4096 * 1280 * 17 // 32)

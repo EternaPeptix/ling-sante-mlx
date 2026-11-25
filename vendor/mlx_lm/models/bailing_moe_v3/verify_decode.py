@@ -31,13 +31,19 @@ from .rows.kda import (
     kda_pre_varlen_rows,
 )
 from .rows.mla import mla_verify_layer_rows, mla_verify_varlen_rows
-from .rows.moe import moe_down_combine_rows, moe_gate_up_swiglu_rows
+from .rows.moe import (
+    moe_down_combine_packed_rows,
+    moe_down_combine_rows,
+    moe_gate_up_swiglu_packed_rows,
+    moe_gate_up_swiglu_rows,
+)
 from .rows.router import group_router_dedup_rows, group_router_rows
 
 _VERIFY_FLUSH_EVERY = int(os.environ.get("LINGSANTE_VERIFY_FLUSH", "1"))
 _USE_LAZY_KDA = os.environ.get("LINGSANTE_LAZY_KDA", "1") not in ("0", "")
 _USE_FUSED_KDA = os.environ.get("LINGSANTE_FUSED_KDA", "1") not in ("0", "")
 _USE_PARTSS_KDA_IN = os.environ.get("LINGSANTE_PARTSS_KDA_IN", "0") not in ("0", "")
+_USE_T7_SE_MAX_B = int(os.environ.get("LINGSANTE_T7_SE_MAX_B", "0"))
 _KDA_CV_NSG = int(os.environ.get("LINGSANTE_KDA_CV_NSG", "1"))
 
 
@@ -506,28 +512,77 @@ def _fast_verify_impl(
                 )
                 dedup = None
             sw = mlp.switch_mlp
-            h_mid = moe_gate_up_swiglu_rows(
-                mlp_in,
-                sw.gate_proj.weight,
-                sw.gate_proj.scales,
-                sw.up_proj.weight,
-                sw.up_proj.scales,
-                inds,
-                dedup=dedup,
-            )
-            sh = gemv_lin(se_mid, se.down_proj)
-            x = moe_down_combine_rows(
-                h_mid,
-                sw.down_proj.weight,
-                sw.down_proj.scales,
-                inds,
-                wts,
-                shared=sh,
-                residual=h_post,
-                tmax=moe_dc_tmax,
-                nsg=moe_dc_nsg,
-                dedup=dedup,
-            )
+            use_packed = hasattr(sw, "_gu_packed")
+            if use_packed:
+                h_mid = moe_gate_up_swiglu_packed_rows(mlp_in, sw._gu_packed, inds, dedup=dedup)
+            else:
+                h_mid = moe_gate_up_swiglu_rows(
+                    mlp_in,
+                    sw.gate_proj.weight,
+                    sw.gate_proj.scales,
+                    sw.up_proj.weight,
+                    sw.up_proj.scales,
+                    inds,
+                    dedup=dedup,
+                )
+            use_t7 = (B <= _USE_T7_SE_MAX_B) and hasattr(se.down_proj, "weight_fp8")
+            if use_t7:
+                if use_packed:
+                    x = moe_down_combine_packed_rows(
+                        h_mid,
+                        sw._dn_packed,
+                        inds,
+                        wts,
+                        residual=h_post,
+                        tmax=moe_dc_tmax,
+                        nsg=moe_dc_nsg,
+                        dedup=dedup,
+                        se_mid=se_mid,
+                        se_w_fp8=se.down_proj.weight_fp8,
+                        se_sc=se.down_proj.weight_scale_inv,
+                    )
+                else:
+                    x = moe_down_combine_rows(
+                        h_mid,
+                        sw.down_proj.weight,
+                        sw.down_proj.scales,
+                        inds,
+                        wts,
+                        residual=h_post,
+                        tmax=moe_dc_tmax,
+                        nsg=moe_dc_nsg,
+                        dedup=dedup,
+                        se_mid=se_mid,
+                        se_w_fp8=se.down_proj.weight_fp8,
+                        se_sc=se.down_proj.weight_scale_inv,
+                    )
+            else:
+                sh = gemv_lin(se_mid, se.down_proj)
+                if use_packed:
+                    x = moe_down_combine_packed_rows(
+                        h_mid,
+                        sw._dn_packed,
+                        inds,
+                        wts,
+                        shared=sh,
+                        residual=h_post,
+                        tmax=moe_dc_tmax,
+                        nsg=moe_dc_nsg,
+                        dedup=dedup,
+                    )
+                else:
+                    x = moe_down_combine_rows(
+                        h_mid,
+                        sw.down_proj.weight,
+                        sw.down_proj.scales,
+                        inds,
+                        wts,
+                        shared=sh,
+                        residual=h_post,
+                        tmax=moe_dc_tmax,
+                        nsg=moe_dc_nsg,
+                        dedup=dedup,
+                    )
             x_pss = None
         else:
             if pss_o is not None:

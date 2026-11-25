@@ -293,3 +293,48 @@ All numbers below are strictly **bit-exact greedy (`0` token diffs AND `0` logpr
   * `bench/http_smoke.py --max-tokens 128`: `C=1`: **`34.67–48.76 tok/s`**; `C=4` concurrent: `423 tok in 5.44s` (**`77.72 agg tok/s`**, vs `72.46`, **`+7.3%`**), **`exact_vs_C1=True`**.
   * `bench/http_smoke.py --max-tokens 256`: `C=1`: **`43.63–54.81 tok/s`**; `C=4` concurrent: `517 tok in 6.45s` (**`80.17 agg tok/s`**, vs `69.60`, **`+15.2%`**), **`exact_vs_C1=True`**.
   * Non-greedy `temperature=0.7, top_p=0.95` `/v1/chat/completions`: HTTP `200`, prompt cache hit (`1/1` delta token on repeat), clean `server.log`.
+
+---
+
+## Phase B: Cold-DRAM Silicon Bandwidth Strike (`512S1`, M3 Ultra `800 GB/s` Peak)
+
+All numbers below are strictly **bit-exact greedy (`0` token diffs AND `0` logprob SHA-256 diffs across 32 steps vs `~/science/runs/baseline.json`)**.
+
+### 1. Ground-Truth Silicon Ceiling (`bench/bw_ledger.py` on `512S1`, Metal `uint4`)
+- **Contiguous-per-TG pipelined (`ntg=160` = 2 TGs/core)**: `2 GiB` read-only **`800.0 GB/s`**, `4 GiB` read-only **`789.2 GB/s`**, `1+1 GiB` read+write **`743.7 GB/s`** (strided high-`ntg=320..5120` capped at `685.9 GB/s`).
+- **Distinct 16x168 MB FP8-buffer raw `uint4` ceiling**: `711.7 GB/s` pipelined (`659.3 GB/s` median); `lm_head` (`1.29 GB`) hits `717–727 GB/s` pipelined vs `730.7 GB/s` raw `uint4` (~98–99% of silicon cap on that buffer).
+
+### 2. Implemented Kernel-Bandwidth Wins (`bw/kda` + `bw/fp8` + `bw/moe` merged cleanly, 100% additive)
+- **1-Launch Mega-Fused KDA + Low-TG MLA + `flush=1` (`rows/kda.py`, `rows/mla.py`, `verify_decode.py`)**:
+  - `kda_fused_verify_rows`: fuses `kda_pre_seq` + optional `lazy_commit` + `kda_gdn_verify` + `kda_o_norm_gate` into **1 single Metal launch/layer** (`189 -> 63` launches; cold 63L KDA: `C1_L1 3.03->2.05 ms`, `C1_L5 3.36->2.46 ms`, `C1_L8 3.87->2.59 ms`, `C4_L3 6.74->5.34 ms`).
+  - Low-TG contiguous `_ML_FP8_SRC` (`gx = min(nt, 8)`), scalar-int `mla_*add_softmax*` (zero per-token `mx.array` param allocations), multi-token `mla_add_softmax_multi_rows` (`2<=lc<=8`), and `_VERIFY_FLUSH_EVERY = 1` (`C4_L3` `bubble`: `+6.59 -> +2.01 ms`).
+- **Unrolled K-Block Prefetch + Zero-Redundant-Shift FP8 GEMVs (`rows/gemv_fp8.py`, `rows/gemv.py`)**:
+  - Prefetches `UNROLL` (2/4) K-blocks of `uchar4` weights + `simd_broadcast_first` scales; `WF_MODE=1` (`B<=8`, hoisted `float4 wf[TM]`) and `WF_MODE=2` (`B=9..12`, `tm`-outer single live `float4` avoiding M3 ~32-reg spill); front-of-grid `b_proj`/`router` tails; deduplicated shared `x0` pointer; cold-16L/32L `_fp8_cfg` tuning.
+  - Cold 63L `kda_qkvfg_b`: `C1_L5 624.6->644.3 GB/s`, `C1_L8 580.4->632.5 GB/s` (`-1.50 ms`), `C4_L3 491.2->520.9 GB/s` (`-1.23 ms`).
+- **Vectorized Zero-Spill MXFP4 MoE + Dependent-Layer Tail-Wave Tiling (`rows/moe.py`, `layers.py`, `utils.py`)**:
+  - 128-bit `uint4` activation + `uint2`/`uint32_t` weight loads + native `Dequantize<4>` (`0` TG mem, `0` barriers in `GU`), zero-barrier `B==1` path, fine-grained critical-path tail-wave tiling (`GU NSG=2, ROWS=2(B=1)/4(B>=2)`; `DC ROWS=4, NSG=8(B=1,B>=5)/2(B=2..4), TMAX=1/2`).
+  - Optional opt-in `LINGSANTE_PACK_MOE=1` (`T3` contiguous MXFP4 repacking, 0 extra steady-state RAM, lossless prefill unpack) saves another `-0.13 to -0.85 ms/cycle` on `B=5..12` decode (`C=4: 94.93 tok/s`), **defaulted to `"0"`** because live `http_smoke` proved per-request prefill unpacking (`+1.13s`) hurts short-prompt HTTP throughput. `LINGSANTE_T7_SE_MAX_B` defaulted to `"0"` (separate `se_down` beat fused `T7` on 72L `C1_L1/L3` by `-0.4..-0.6 ms`).
+
+### 3. Verified Before (`c7f0351`) -> After (`512S1`, default `LINGSANTE_PACK_MOE=0`, all `0` bit diffs)
+- **Full-Model Cold `fast_verify_forward` (`profile_verify_c1 --e2e-only` / `bw_ledger`, vs `c7f0351` & `9e90dde`)**:
+  * `C1_L1` (`21.59 GB`): `39.34 -> 37.65 ms` (**`573.5 GB/s`**, `-1.69 ms`)
+  * `C1_L3`: `48.68 -> 47.13 ms` (`-1.55 ms`)
+  * `C1_L5` (`30.18 GB`): `57.54 -> 54.95 ms` (**`549.2 GB/s`**, `-2.59 ms`; `T3`: `54.66 ms` / `550.5 GB/s`)
+  * `C1_L8` (`33.78 GB`): `68.81 -> 66.43 ms` (**`508.5 GB/s`**, `-2.38 ms`; `T3`: `65.73 ms` / `513.9 GB/s`)
+  * `C1_L9`: `77.76 -> 73.47 ms` (`-4.29 ms`; `-13.97 ms` vs `9e90dde` `87.44`)
+  * `C1_L12`: `89.10 -> 86.36 ms` (`-2.74 ms`; `-13.14 ms` vs `9e90dde` `99.50`)
+  * `C1_L16`: `114.62 -> 109.69 ms` (`-4.93 ms`; `-11.61 ms` vs `9e90dde` `121.30`)
+  * **`C4_L3` (`45.76 GB`)**: `98.01 -> 92.82 ms` (**`492.7 GB/s`**, **`-5.19 ms`**, `-13.20 ms` vs `9e90dde` `106.02`; `T3`: `91.60 ms` / `499.6 GB/s`)
+- **Production `BatchGenerator` (`bench/batch_dec.py --C 1,2,3,4 --tokens 128 --reps 3 --mode batchgen`, `batchgen_bw_final.json`)**:
+  * **`C=1`**: **`52.82 tok/s`** (`52.92 ms/step`, `317.9 GB`; vs `c7f0351` `50.86`, `9e90dde` `50.47`, stock `15.05` — **`3.51x`**) — `exact_tok=True exact_lp32=True`
+  * **`C=2`**: **`78.31 agg tok/s`** (`39.15/stream`, `78.04 ms/step`; `T3`: `78.82`) — `exact_tok=True exact_lp32=True`
+  * **`C=3`**: **`86.81 agg tok/s`** (`28.94/stream`, `103.67 ms/step`; vs `9e90dde` `77.06`, **`+12.7%`**; `T3`: `87.48`) — `exact_tok=True exact_lp32=True`
+  * **`C=4`**: **`94.09 agg tok/s`** (`23.52/stream`, `106.55 ms/step`; vs `9e90dde` `84.13`, **`+11.8%`**; `T3`: `94.93`) — `exact_tok=True exact_lp32=True`
+- **Held-out 4-prompt decode**:
+  * `bench/exact.py --capture` (`generate_step`, 128 tok): **`55.62 median tok/s`** (`medical_stemi: 52.30`, `chemistry_kmno4: 61.95`, `biology_lac: 58.94`, `medical_renal_pharm: 50.64`; vs `9e90dde` `51.88`, **`+7.2%`**), **`GATE PASS`**.
+  * `bench/eagle3_mtp_bench.py --dyn-th 0.55`: **`55.46 med / 55.42 weighted tok/s`** (`cyc=55.22 ms`, `td=0 ld=0`; `@256`: `53.16 / 54.39`).
+- **Verification suites**: `rows_fp8_test`, `rows_moe_test`, `verify_kernels_test`, `server_exact_test`, `ctx_exact_test` (`fastdecode C=1/4 = 25.13 / 64.55`), `EDGE_CASES_PASS`, `run_eval ppl` (`0.04473 / 0.04646`), `run_eval gen` (`49.0–60.8 tok/s`): **ALL PASS**.
+- **Live HTTP `mlx_lm.server` (`512S1:8080`, `pid=50880`, `--decode-concurrency 4 --prompt-concurrency 1`)**:
+  * `http_smoke --max-tokens 128`: `C=1`: **`35.38–49.82 tok/s`**; `C=4` (cold PSO): `68.34 agg tok/s`, `exact_vs_C1=True`.
+  * `http_smoke --max-tokens 256`: `C=1`: **`45.06–56.69 tok/s`** (vs `9e90dde` `39.54–52.05`); `C=4`: **`517 tok in 6.52s = 79.32 agg tok/s`**, `exact_vs_C1=True`.
+  * Non-greedy `temperature=0.7, top_p=0.95`: HTTP `200`, `~45 tok/s` (128 tok in `2.8s`), prompt cache hit (`1/1` delta token), clean `server.log`.

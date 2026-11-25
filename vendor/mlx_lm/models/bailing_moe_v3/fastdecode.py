@@ -15,10 +15,16 @@ from .rows.gemv_fp8 import (
 )
 from .rows.kda import kda_gdn_norm_gate_rows, kda_pre_rows
 from .rows.mla import mla_layer_rows
-from .rows.moe import moe_down_combine_rows, moe_gate_up_swiglu_rows
+from .rows.moe import (
+    moe_down_combine_packed_rows,
+    moe_down_combine_rows,
+    moe_gate_up_swiglu_packed_rows,
+    moe_gate_up_swiglu_rows,
+)
 from .rows.router import group_router_dedup_rows, group_router_rows
 
 _FAST_FLUSH_EVERY = int(os.environ.get("LINGSANTE_FAST_FLUSH", "4"))
+_USE_T7_SE_MAX_B = int(os.environ.get("LINGSANTE_T7_SE_MAX_B", "0"))
 
 
 def can_fast_decode(model, inputs, cache) -> bool:
@@ -188,26 +194,69 @@ def fast_decode_forward(model, inputs, cache):
                 )
                 dedup = None
             sw = mlp.switch_mlp
-            h_mid = moe_gate_up_swiglu_rows(
-                mlp_in,
-                sw.gate_proj.weight,
-                sw.gate_proj.scales,
-                sw.up_proj.weight,
-                sw.up_proj.scales,
-                inds,
-                dedup=dedup,
-            )
-            sh = gemv_lin(se_mid, se.down_proj)
-            x = moe_down_combine_rows(
-                h_mid,
-                sw.down_proj.weight,
-                sw.down_proj.scales,
-                inds,
-                wts,
-                shared=sh,
-                residual=h_post,
-                dedup=dedup,
-            )
+            use_packed = hasattr(sw, "_gu_packed")
+            if use_packed:
+                h_mid = moe_gate_up_swiglu_packed_rows(mlp_in, sw._gu_packed, inds, dedup=dedup)
+            else:
+                h_mid = moe_gate_up_swiglu_rows(
+                    mlp_in,
+                    sw.gate_proj.weight,
+                    sw.gate_proj.scales,
+                    sw.up_proj.weight,
+                    sw.up_proj.scales,
+                    inds,
+                    dedup=dedup,
+                )
+            use_t7 = (x.shape[0] <= _USE_T7_SE_MAX_B) and hasattr(se.down_proj, "weight_fp8")
+            if use_t7:
+                if use_packed:
+                    x = moe_down_combine_packed_rows(
+                        h_mid,
+                        sw._dn_packed,
+                        inds,
+                        wts,
+                        residual=h_post,
+                        dedup=dedup,
+                        se_mid=se_mid,
+                        se_w_fp8=se.down_proj.weight_fp8,
+                        se_sc=se.down_proj.weight_scale_inv,
+                    )
+                else:
+                    x = moe_down_combine_rows(
+                        h_mid,
+                        sw.down_proj.weight,
+                        sw.down_proj.scales,
+                        inds,
+                        wts,
+                        residual=h_post,
+                        dedup=dedup,
+                        se_mid=se_mid,
+                        se_w_fp8=se.down_proj.weight_fp8,
+                        se_sc=se.down_proj.weight_scale_inv,
+                    )
+            else:
+                sh = gemv_lin(se_mid, se.down_proj)
+                if use_packed:
+                    x = moe_down_combine_packed_rows(
+                        h_mid,
+                        sw._dn_packed,
+                        inds,
+                        wts,
+                        shared=sh,
+                        residual=h_post,
+                        dedup=dedup,
+                    )
+                else:
+                    x = moe_down_combine_rows(
+                        h_mid,
+                        sw.down_proj.weight,
+                        sw.down_proj.scales,
+                        inds,
+                        wts,
+                        shared=sh,
+                        residual=h_post,
+                        dedup=dedup,
+                    )
             x_pss = None
         else:
             if pss_o is not None:

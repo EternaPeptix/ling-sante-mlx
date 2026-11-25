@@ -615,6 +615,7 @@ def load_model(
 
         attach_lingsante_fp8(model, weights, model_path)
     model.load_weights(list(weights.items()), strict=strict)
+    weights.clear()
 
     if not lazy:
         mx.eval(model.parameters())
@@ -623,6 +624,10 @@ def load_model(
                 from .models.bailing_moe_v3.rows.gemv_fp8 import attach_merged_kda_qkvfg
 
                 attach_merged_kda_qkvfg(model)
+            if os.environ.get("LINGSANTE_PACK_MOE", "0") not in ("0", ""):
+                from .models.bailing_moe_v3.rows.moe import attach_packed_moe_weights
+
+                attach_packed_moe_weights(model)
             from .models.bailing_moe_v3.spec_engine import attach_lingsante_mtp
 
             attach_lingsante_mtp(model, model_path)

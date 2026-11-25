@@ -1945,3 +1945,42 @@ def moe_down_combine_packed_rows(
         output_shapes=[(B, N)], output_dtypes=[mx.bfloat16],
     )
     return out
+
+
+def attach_packed_moe_weights(model) -> int:
+    """Repack MXFP4 SwitchGLU expert weights+scales into contiguous T3 tiles in-place (0 extra steady-state RAM)."""
+    inner = getattr(model, "model", None)
+    layers = getattr(inner, "layers", None)
+    if not layers:
+        return 0
+    n_packed = 0
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        sw = getattr(mlp, "switch_mlp", None)
+        if sw is None or hasattr(sw, "_gu_packed"):
+            continue
+        gp, up, dp = sw.gate_proj, sw.up_proj, sw.down_proj
+        if (
+            getattr(gp, "bits", None) != 4
+            or getattr(gp, "group_size", None) != 32
+            or getattr(gp, "weight", None) is None
+        ):
+            continue
+        gu_pk = pack_moe_gu_weights(gp.weight, gp.scales, up.weight, up.scales)
+        mx.eval(gu_pk)
+        sw._gu_packed = gu_pk
+        gp.weight = None
+        gp.scales = None
+        up.weight = None
+        up.scales = None
+        dn_pk = pack_moe_dn_weights(dp.weight, dp.scales)
+        mx.eval(dn_pk)
+        sw._dn_packed = dn_pk
+        dp.weight = None
+        dp.scales = None
+        n_packed += 1
+        if n_packed % 4 == 0:
+            mx.clear_cache()
+    if n_packed:
+        mx.clear_cache()
+    return n_packed
