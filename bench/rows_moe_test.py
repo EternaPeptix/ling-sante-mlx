@@ -8,12 +8,19 @@ sys.path[:0] = [str(_root / "vendor"), str(_root)]
 import mlx.core as mx  # noqa: E402
 from mlx_lm.layers.common import swiglu  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.gemv import gemv_rows, gemv_swiglu_rows  # noqa: E402
+from mlx_lm.models.bailing_moe_v3.rows.gemv_fp8 import gemv_lin, gemv_lin_swiglu  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.gather import gather_rows  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.moe import (  # noqa: E402
     moe_combine8_sh_res_rows,
     moe_dedup_rows,
+    moe_down_combine_packed_rows,
     moe_down_combine_rows,
+    moe_gate_up_swiglu_packed_rows,
     moe_gate_up_swiglu_rows,
+    pack_moe_dn_weights,
+    pack_moe_gu_weights,
+    unpack_moe_dn_weights,
+    unpack_moe_gu_weights,
 )
 from mlx_lm.models.bailing_moe_v3.rows.router import gate_rows  # noqa: E402
 
@@ -105,7 +112,7 @@ def main():
             [7, 17, 17, 17, 511, 0, 42, 100],
             [17, 17, 17, 17, 17, 17, 17, 17],
         ]
-        for B in (2, 3, 4):
+        for B in (1, 2, 3, 4):
             xm = mx.random.normal((B, 4096)).astype(mx.bfloat16)
             hp = mx.random.normal((B, 4096)).astype(mx.bfloat16)
             sh = mx.random.normal((B, 4096)).astype(mx.bfloat16)
@@ -115,14 +122,15 @@ def main():
 
             _, _, ref_m, _, ref_comb = stock_routed_b1(layer, xm, inds, wts)
             ref_full = (ref_comb + sh) + hp
+            dd_c = moe_dedup_rows(inds) if B >= 2 else None
 
             got_m = moe_gate_up_swiglu_rows(
-                xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds
+                xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dd_c
             )
             ok &= check(f"L{L} B={B} coll gate_up_swiglu", got_m, ref_m)
 
             got_full = moe_down_combine_rows(
-                got_m, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=hp
+                got_m, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=hp, dedup=dd_c
             )
             ok &= check(f"L{L} B={B} coll down_combine+sh+res", got_full, ref_full)
 
@@ -192,6 +200,64 @@ def main():
                 shared=sh, residual=hp, dedup=dd_arg,
             )
             ok &= check(f"L{L} B=16 forced({mode}) adapt dc", gf, ref_fullf)
+
+        # 4. T3 lossless pack/unpack round-trip + packed kernels & T7 se_down fusion (FP8 shared_experts)
+        layer_fp8, _ = load_layer(L, use_fp8=True)
+        se_fp8 = layer_fp8.mlp.shared_experts
+        sw_fp8 = layer_fp8.mlp.switch_mlp
+        gu_pk = pack_moe_gu_weights(
+            sw_fp8.gate_proj.weight, sw_fp8.gate_proj.scales,
+            sw_fp8.up_proj.weight, sw_fp8.up_proj.scales,
+        )
+        dn_pk = pack_moe_dn_weights(sw_fp8.down_proj.weight, sw_fp8.down_proj.scales)
+        u_wg, u_sg, u_wu, u_su = unpack_moe_gu_weights(gu_pk)
+        u_wd, u_sd = unpack_moe_dn_weights(dn_pk)
+        ok &= check(f"L{L} T3 unpack wg", u_wg, sw_fp8.gate_proj.weight)
+        ok &= check(f"L{L} T3 unpack sg", u_sg, sw_fp8.gate_proj.scales)
+        ok &= check(f"L{L} T3 unpack wu", u_wu, sw_fp8.up_proj.weight)
+        ok &= check(f"L{L} T3 unpack su", u_su, sw_fp8.up_proj.scales)
+        ok &= check(f"L{L} T3 unpack wd", u_wd, sw_fp8.down_proj.weight)
+        ok &= check(f"L{L} T3 unpack sd", u_sd, sw_fp8.down_proj.scales)
+
+        for B in (1, 3, 5, 8, 12):
+            base = (mx.random.normal((1, 4096)) * 0.25).astype(mx.bfloat16)
+            xm = (base + (mx.random.normal((B, 4096)) * 0.14)).astype(mx.bfloat16)
+            hp = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+            gate = layer_fp8.mlp.gate
+            inds_p, wts_p = gate_rows(
+                xm, gate.weight, gate.expert_bias,
+                top_k=gate.top_k, n_group=gate.n_group, topk_group=gate.topk_group,
+                routed_scaling_factor=gate.routed_scaling_factor,
+            )
+            dd_p = moe_dedup_rows(inds_p) if B >= 2 else None
+            se_mid = gemv_lin_swiglu(xm, se_fp8.gate_proj, se_fp8.up_proj)
+            sh_ref = gemv_lin(se_mid, se_fp8.down_proj)
+            ref_m = moe_gate_up_swiglu_rows(
+                xm, sw_fp8.gate_proj.weight, sw_fp8.gate_proj.scales,
+                sw_fp8.up_proj.weight, sw_fp8.up_proj.scales, inds_p, dedup=dd_p,
+            )
+            ref_dc = moe_down_combine_rows(
+                ref_m, sw_fp8.down_proj.weight, sw_fp8.down_proj.scales,
+                inds_p, wts_p, shared=sh_ref, residual=hp, dedup=dd_p,
+            )
+            got_t7 = moe_down_combine_rows(
+                ref_m, sw_fp8.down_proj.weight, sw_fp8.down_proj.scales,
+                inds_p, wts_p, residual=hp, dedup=dd_p,
+                se_mid=se_mid, se_w_fp8=se_fp8.down_proj.weight_fp8, se_sc=se_fp8.down_proj.weight_scale_inv,
+            )
+            ok &= check(f"L{L} B={B} T7 dc+se_down", got_t7, ref_dc)
+            for skb in (False, True):
+                got_pk_gu = moe_gate_up_swiglu_packed_rows(xm, gu_pk, inds_p, dedup=dd_p, single_kb=skb)
+                ok &= check(f"L{L} B={B} T3 gu_packed(skb={int(skb)})", got_pk_gu, ref_m)
+            got_pk_dc = moe_down_combine_packed_rows(
+                ref_m, dn_pk, inds_p, wts_p, shared=sh_ref, residual=hp, dedup=dd_p,
+            )
+            ok &= check(f"L{L} B={B} T3 dc_packed", got_pk_dc, ref_dc)
+            got_pk_t7 = moe_down_combine_packed_rows(
+                ref_m, dn_pk, inds_p, wts_p, residual=hp, dedup=dd_p,
+                se_mid=se_mid, se_w_fp8=se_fp8.down_proj.weight_fp8, se_sc=se_fp8.down_proj.weight_scale_inv,
+            )
+            ok &= check(f"L{L} B={B} T3+T7 dc_packed+se", got_pk_t7, ref_dc)
 
     print("SUMMARY:", "ALL PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

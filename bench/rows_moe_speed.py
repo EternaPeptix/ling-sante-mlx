@@ -15,10 +15,15 @@ from mlx_lm.models.bailing_moe_v3.rows.gather import gather_rows  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.moe import (  # noqa: E402
     moe_combine8_sh_res_rows,
     moe_dedup_rows,
+    moe_down_combine_packed_rows,
     moe_down_combine_rows,
+    moe_gate_up_swiglu_packed_rows,
     moe_gate_up_swiglu_rows,
+    pack_moe_dn_weights,
+    pack_moe_gu_weights,
 )
-from mlx_lm.models.bailing_moe_v3.rows.router import gate_rows  # noqa: E402
+from mlx_lm.models.bailing_moe_v3.rows.router import gate_dedup_rows, gate_rows  # noqa: E402
+from mlx_lm.utils import maybe_set_recommended_wired_limit  # noqa: E402
 
 from bench._layer_loader import bit_diff_count, load_layer, load_visits  # noqa: E402
 
@@ -159,10 +164,274 @@ def sweep_large(l4):
         )
 
 
+def bench_cold_layers(layers_fn, n_layers: int, reps: int = 5, warm: int = 1) -> float:
+    """Zero-sync-bias cold-DRAM per-layer us via (T(3 sweeps) - T(1 sweep)) / (2 * n_layers)."""
+    for _ in range(warm):
+        mx.eval(layers_fn())
+    mx.synchronize()
+    dts = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        mx.eval(layers_fn())
+        a = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        mx.eval(layers_fn() + layers_fn() + layers_fn())
+        b = time.perf_counter() - t1
+        dts.append((b - a) * 1e6 / (2 * n_layers))
+    return st.median(dts)
+
+
+def _make_batch_x(B: int, seed: int, mode: str = "c1") -> mx.array:
+    """Realistic activations matching real verify_decode U distributions (C1_L1..L8 and C4_L3 at B=12)."""
+    mx.random.seed(seed)
+    if B == 12 and mode == "c4":
+        # Shared topic + 4 stream offsets + 3 correlated draft tokens -> U ~ 38-42 (matches real C4_L3!)
+        shared = (mx.random.normal((1, 1, 4096)) * 0.22).astype(mx.bfloat16)
+        streams = (mx.random.normal((4, 1, 4096)) * 0.14).astype(mx.bfloat16)
+        deltas = (mx.random.normal((4, 3, 4096)) * 0.10).astype(mx.bfloat16)
+        return (shared + streams + deltas).reshape(12, 4096).astype(mx.bfloat16)
+    base = (mx.random.normal((1, 4096)) * 0.25).astype(mx.bfloat16)
+    delta = (mx.random.normal((B, 4096)) * 0.14).astype(mx.bfloat16)
+    return (base + delta).astype(mx.bfloat16)
+
+
+def ab_bw_bench(n_layers: int = 16):
+    """Comprehensive 16-layer cold-DRAM ablation + 0-diff verification across B=1,3,5,8,12."""
+    maybe_set_recommended_wired_limit()
+    layer_ids = [4 + i * (60 // max(1, n_layers - 1)) for i in range(n_layers)]
+    print(f"Loading {n_layers} MoE layers {layer_ids} for 16-layer cold-DRAM ablation...", flush=True)
+    t0 = time.perf_counter()
+    layers = [load_layer(li, use_fp8=True)[0] for li in layer_ids]
+    print(f"Loaded {n_layers} layers in {time.perf_counter() - t0:.1f}s", flush=True)
+
+    # Pack T3 weights on the same 16 cold layers (measure pack time once)
+    t0 = time.perf_counter()
+    pk_gu = [
+        pack_moe_gu_weights(
+            l.mlp.switch_mlp.gate_proj.weight, l.mlp.switch_mlp.gate_proj.scales,
+            l.mlp.switch_mlp.up_proj.weight, l.mlp.switch_mlp.up_proj.scales,
+        )
+        for l in layers
+    ]
+    pk_dn = [
+        pack_moe_dn_weights(l.mlp.switch_mlp.down_proj.weight, l.mlp.switch_mlp.down_proj.scales)
+        for l in layers
+    ]
+    mx.eval(*pk_gu, *pk_dn)
+    mx.synchronize()
+    print(f"Packed T3 ({n_layers} layers) in {time.perf_counter() - t0:.2f}s\n", flush=True)
+
+    GU_B = 2 * 1280 * 4096 * 17 // 32
+    DC_B = 4096 * 1280 * 17 // 32
+
+    cases = [(1, "c1"), (3, "c1"), (5, "c1"), (8, "c1"), (12, "c4")]
+    for B, mode in cases:
+        xs, hps, se_mids, shs, indss, wtss, dds, ref_gus, ref_dcs = [], [], [], [], [], [], [], [], []
+        uniqs, hots = [], []
+        for idx, lay in enumerate(layers):
+            xm = _make_batch_x(B, seed=2000 + B * 100 + idx, mode=mode)
+            hp = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+            gate = lay.mlp.gate
+            se = lay.mlp.shared_experts
+            sw = lay.mlp.switch_mlp
+            if B >= 2:
+                inds, wts, dd = gate_dedup_rows(
+                    xm, gate.weight, gate.expert_bias,
+                    top_k=gate.top_k, n_group=gate.n_group, topk_group=gate.topk_group,
+                    routed_scaling_factor=gate.routed_scaling_factor,
+                )
+            else:
+                inds, wts = gate_rows(
+                    xm, gate.weight, gate.expert_bias,
+                    top_k=gate.top_k, n_group=gate.n_group, topk_group=gate.topk_group,
+                    routed_scaling_factor=gate.routed_scaling_factor,
+                )
+                dd = None
+            sm = gemv_lin_swiglu(xm, se.gate_proj, se.up_proj)
+            sh = gemv_lin(sm, se.down_proj)
+            rgu = moe_gate_up_swiglu_rows(
+                xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dd
+            )
+            rdc = moe_down_combine_rows(
+                rgu, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=hp, dedup=dd
+            )
+            mx.eval(xm, hp, sm, sh, inds, wts, rgu, rdc)
+            if dd is not None:
+                mx.eval(*dd)
+                uniqs.append(int(dd[4].item()))
+                hots.append(int(dd[2].item()))
+            else:
+                uniqs.append(8)
+                hots.append(0)
+            xs.append(xm); hps.append(hp); se_mids.append(sm); shs.append(sh)
+            indss.append(inds); wtss.append(wts); dds.append(dd); ref_gus.append(rgu); ref_dcs.append(rdc)
+
+        u_avg = sum(uniqs) / len(uniqs)
+        h_avg = sum(hots) / len(hots)
+        print(f"=== B={B:2d} ({mode}, U={u_avg:4.1f}, hot={h_avg:4.1f}, cold={n_layers*u_avg*(GU_B+DC_B)/1e9:.2f} GB) ===", flush=True)
+
+        gu_cands = [
+            ("unpacked_prod", lambda i: moe_gate_up_swiglu_rows(
+                xs[i], layers[i].mlp.switch_mlp.gate_proj.weight, layers[i].mlp.switch_mlp.gate_proj.scales,
+                layers[i].mlp.switch_mlp.up_proj.weight, layers[i].mlp.switch_mlp.up_proj.scales, indss[i], dedup=dds[i])),
+            ("T3_pk_2pass", lambda i: moe_gate_up_swiglu_packed_rows(
+                xs[i], pk_gu[i], indss[i], dedup=dds[i], single_kb=False)),
+            ("T3_pk_1pass", lambda i: moe_gate_up_swiglu_packed_rows(
+                xs[i], pk_gu[i], indss[i], dedup=dds[i], single_kb=True)),
+        ]
+        for name, fn in gu_cands:
+            y0 = fn(0)
+            mx.eval(y0)
+            d0 = bit_diff_count(y0, ref_gus[0])
+            if d0 != 0:
+                print(f"  GU {name:14s}: DIFF={d0}/{ref_gus[0].size}", flush=True)
+                continue
+            t_us = bench_cold_layers(lambda fn=fn: [fn(i) for i in range(n_layers)], n_layers, reps=5)
+            print(f"  GU {name:14s}: {t_us*68/1e3:6.2f} ms | {(u_avg*GU_B)/(t_us*1e3):6.1f} GB/s", flush=True)
+
+        t_se = bench_cold_layers(lambda: [gemv_lin(se_mids[i], layers[i].mlp.shared_experts.down_proj) for i in range(n_layers)], n_layers, reps=5)
+        se_ms = t_se * 68 / 1e3
+        dc_cands = [
+            ("unpacked_prod", lambda i: moe_down_combine_rows(
+                ref_gus[i], layers[i].mlp.switch_mlp.down_proj.weight, layers[i].mlp.switch_mlp.down_proj.scales,
+                indss[i], wtss[i], shared=shs[i], residual=hps[i], dedup=dds[i])),
+            ("unpacked+T7se", lambda i: moe_down_combine_rows(
+                ref_gus[i], layers[i].mlp.switch_mlp.down_proj.weight, layers[i].mlp.switch_mlp.down_proj.scales,
+                indss[i], wtss[i], residual=hps[i], dedup=dds[i],
+                se_mid=se_mids[i], se_w_fp8=layers[i].mlp.shared_experts.down_proj.weight_fp8,
+                se_sc=layers[i].mlp.shared_experts.down_proj.weight_scale_inv)),
+            ("T3_dc_packed", lambda i: moe_down_combine_packed_rows(
+                ref_gus[i], pk_dn[i], indss[i], wtss[i], shared=shs[i], residual=hps[i], dedup=dds[i])),
+            ("T3_dc+T7se", lambda i: moe_down_combine_packed_rows(
+                ref_gus[i], pk_dn[i], indss[i], wtss[i], residual=hps[i], dedup=dds[i],
+                se_mid=se_mids[i], se_w_fp8=layers[i].mlp.shared_experts.down_proj.weight_fp8,
+                se_sc=layers[i].mlp.shared_experts.down_proj.weight_scale_inv)),
+        ]
+        for name, fn in dc_cands:
+            y0 = fn(0)
+            mx.eval(y0)
+            d0 = bit_diff_count(y0, ref_dcs[0])
+            if d0 != 0:
+                print(f"  DC {name:14s}: DIFF={d0}/{ref_dcs[0].size}", flush=True)
+                continue
+            t_us = bench_cold_layers(lambda fn=fn: [fn(i) for i in range(n_layers)], n_layers, reps=5)
+            ms = t_us * 68 / 1e3
+            extra = f" (fused vs sep {se_ms:.2f})" if "T7se" in name else f" (+se={ms+se_ms:.2f})"
+            print(f"  DC {name:14s}: {ms:6.2f} ms | {(u_avg*DC_B)/(t_us*1e3):6.1f} GB/s{extra}", flush=True)
+
+
+def cold_bw_bench(n_layers: int = 16, bs=(1, 3, 5, 8, 12)):
+    """Cold >=16-layer (>1.1-5.4 GB active weights) DRAM bandwidth benchmark for MoE GU & DC."""
+    maybe_set_recommended_wired_limit()
+    # Spread 16 MoE layers across 4..64 (4, 8, 12, ..., 64)
+    layer_ids = [4 + i * (60 // max(1, n_layers - 1)) for i in range(n_layers)]
+    print(f"Loading {n_layers} MoE layers {layer_ids} (FP8) for cold-DRAM bandwidth bench...", flush=True)
+    t0 = time.perf_counter()
+    layers = [load_layer(li, use_fp8=True)[0] for li in layer_ids]
+    print(f"Loaded {n_layers} layers in {time.perf_counter() - t0:.1f}s\n", flush=True)
+
+    # Exact unique-expert byte counts for MXFP4 (group_size=32 -> 0.53125 B/param):
+    #   GU (gate+up): 2 * 1280 * 4096 * 0.53125 = 5,570,560 B (5.57056 MB)
+    #   DC (down):    1 * 4096 * 1280 * 0.53125 = 2,785,280 B (2.78528 MB)
+    #   Total/expert: 8,355,840 B (8.35584 MB)
+    GU_B = 2 * 1280 * 4096 * 17 // 32
+    DC_B = 4096 * 1280 * 17 // 32
+
+    print(f"=== COLD {n_layers}-Layer DRAM Bandwidth (c7f0351 / current rows/moe.py) ===", flush=True)
+    print(f"{'B':>3} {'U_avg':>5} {'hot':>4} {'coldGB':>6} | {'GU_ms':>6} {'GU_GB/s':>7} | {'DC_ms':>6} {'DC_GB/s':>7} | {'TOT_ms':>6} {'TOT_GB/s':>8} | {'SE_dn':>5}", flush=True)
+    for B in bs:
+        xs, hps, se_mids, shs, indss, wtss, dds, h_mids = [], [], [], [], [], [], [], []
+        uniqs, hots = [], []
+        for idx, lay in enumerate(layers):
+            xm = _make_batch_x(B, seed=1000 + B * 100 + idx)
+            hp = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+            gate = lay.mlp.gate
+            se = lay.mlp.shared_experts
+            sw = lay.mlp.switch_mlp
+            if B >= 2:
+                inds, wts, dd = gate_dedup_rows(
+                    xm, gate.weight, gate.expert_bias,
+                    top_k=gate.top_k, n_group=gate.n_group, topk_group=gate.topk_group,
+                    routed_scaling_factor=gate.routed_scaling_factor,
+                )
+            else:
+                inds, wts = gate_rows(
+                    xm, gate.weight, gate.expert_bias,
+                    top_k=gate.top_k, n_group=gate.n_group, topk_group=gate.topk_group,
+                    routed_scaling_factor=gate.routed_scaling_factor,
+                )
+                dd = None
+            sm = gemv_lin_swiglu(xm, se.gate_proj, se.up_proj)
+            sh = gemv_lin(sm, se.down_proj)
+            hm = moe_gate_up_swiglu_rows(
+                xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales, inds, dedup=dd
+            )
+            mx.eval(xm, hp, sm, sh, inds, wts, hm)
+            if dd is not None:
+                mx.eval(*dd)
+                uniqs.append(int(dd[4].item()))
+                hots.append(int(dd[2].item()))
+            else:
+                uniqs.append(len(set(inds.reshape(-1).tolist())))
+                hots.append(0)
+            xs.append(xm); hps.append(hp); se_mids.append(sm); shs.append(sh)
+            indss.append(inds); wtss.append(wts); dds.append(dd); h_mids.append(hm)
+
+        u_avg = sum(uniqs) / len(uniqs)
+        h_avg = sum(hots) / len(hots)
+        cold_gb = n_layers * u_avg * (GU_B + DC_B) / 1e9
+
+        t_gu = bench_cold_layers(lambda: [
+            moe_gate_up_swiglu_rows(
+                xs[i], layers[i].mlp.switch_mlp.gate_proj.weight, layers[i].mlp.switch_mlp.gate_proj.scales,
+                layers[i].mlp.switch_mlp.up_proj.weight, layers[i].mlp.switch_mlp.up_proj.scales,
+                indss[i], dedup=dds[i],
+            )
+            for i in range(n_layers)
+        ], n_layers)
+
+        t_dc = bench_cold_layers(lambda: [
+            moe_down_combine_rows(
+                h_mids[i], layers[i].mlp.switch_mlp.down_proj.weight, layers[i].mlp.switch_mlp.down_proj.scales,
+                indss[i], wtss[i], shared=shs[i], residual=hps[i], dedup=dds[i],
+            )
+            for i in range(n_layers)
+        ], n_layers)
+
+        t_se = bench_cold_layers(lambda: [
+            gemv_lin(se_mids[i], layers[i].mlp.shared_experts.down_proj)
+            for i in range(n_layers)
+        ], n_layers)
+
+        gu_ms = t_gu * 68 / 1e3
+        dc_ms = t_dc * 68 / 1e3
+        se_ms = t_se * 68 / 1e3
+        tot_ms = gu_ms + dc_ms
+        gu_gbs = (u_avg * GU_B) / (t_gu * 1e3)
+        dc_gbs = (u_avg * DC_B) / (t_dc * 1e3)
+        tot_gbs = (u_avg * (GU_B + DC_B)) / ((t_gu + t_dc) * 1e3)
+        print(
+            f"{B:3d} {u_avg:5.1f} {h_avg:4.1f} {cold_gb:6.2f} | "
+            f"{gu_ms:6.2f} {gu_gbs:7.1f} | {dc_ms:6.2f} {dc_gbs:7.1f} | "
+            f"{tot_ms:6.2f} {tot_gbs:8.1f} | {se_ms:5.2f}",
+            flush=True,
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--cold-bw", action="store_true")
+    ap.add_argument("--ab-bw", action="store_true")
+    ap.add_argument("--layers", type=int, default=16)
     a = ap.parse_args()
+
+    if a.ab_bw:
+        ab_bw_bench(n_layers=a.layers)
+        return
+    if a.cold_bw:
+        cold_bw_bench(n_layers=a.layers)
+        return
 
     l4, _ = load_layer(4)
     if a.sweep:
