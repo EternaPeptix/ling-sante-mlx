@@ -619,6 +619,10 @@ def load_model(
     if not lazy:
         mx.eval(model.parameters())
         if "bailing_moe_v3" in type(model).__module__:
+            if os.environ.get("LINGSANTE_MERGED_QKVFG", "0") not in ("0", ""):
+                from .models.bailing_moe_v3.rows.gemv_fp8 import attach_merged_kda_qkvfg
+
+                attach_merged_kda_qkvfg(model)
             from .models.bailing_moe_v3.spec_engine import attach_lingsante_mtp
 
             attach_lingsante_mtp(model, model_path)

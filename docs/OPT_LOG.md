@@ -245,3 +245,51 @@ Wired native MTP cleanly into `vendor/mlx_lm` (`LINGSANTE_MTP=1` default-on when
   * `bench/http_smoke.py --base-url http://127.0.0.1:8080 --max-tokens 128`: `C=1`: `31.54–45.07 tok/s` (`72–128` tok); `C=4` concurrent: `423 tok in 5.84s` (**`72.46 agg tok/s`** incl. HTTP/prefill/EOS stagger), **`exact_vs_C1=True`**.
   * `bench/http_smoke.py --base-url http://127.0.0.1:8080 --max-tokens 256`: `C=1`: `39.54–52.05 tok/s` (`72–217` tok); `C=4` concurrent: `517 tok in 7.43s` (**`69.60 agg tok/s`**), **`exact_vs_C1=True`**.
   * Non-greedy `temperature=0.7` `/v1/chat/completions` sanity check: HTTP `200`, `24/25` cached prompt tokens, clean `server.log`.
+
+---
+
+## Phase A: Zero-Training Bit-Exact Kernel, Drafter, Scheduling & Serving Optimizations (`512S1`)
+
+All numbers below are strictly **bit-exact greedy (`0` token diffs AND `0` logprob SHA-256 diffs across 32 steps vs `~/science/runs/baseline.json`)** unless explicitly testing exact `temperature > 0` rejection sampling.
+
+### Implemented Changes (5 parallel branches merged & bisected on `512S1`)
+1. **FP8 GEMV & `lm_head` (`rows/gemv_fp8.py`, `rows/gemv.py`)**:
+   - Fixed P0 barrier UB in `gemv_fp8.py`; replaced LUT with Zero-Mul-256 E4M3 ALU + `bfloat4` vectorized output; eliminated the `B=9..12` `bsg=2` spill cliff (`bsg=1, bm_m=4, tm=2, b_reg=12`, zero `tg_acc` spill across `B=5..12`, `bm_m=8, tm=2` at `B=13..16`); fixed `lm_head` `B=13..16`; fused `b_proj+qkvfg` (`gemv_lin_multi`) and `router+se_swiglu` (`gemv_router_se_swiglu_rows`).
+   - Bisection finding: kept `LINGSANTE_PARTSS_KDA_IN=0` (`part_ss` inside KDA `qkvfg` x62 regressed `+2.1..+14.4 ms`) and `LINGSANTE_MERGED_QKVFG=0` (`+1.44..+1.80 ms` slower than `gemv_lin_multi` on cold DRAM).
+2. **KDA, MLA & Prefill (`rows/kda.py`, `rows/mla.py`, `rows/glue.py`, `kernels/gated_delta.py`, `fp8.py`, `fastdecode.py`)**:
+   - Zero-spill KDA GDN (~50 regs vs 136) with `8x float4` state I/O + `(h, t)`-parallel `kda_pre_seq_rows(emit_hist=False)` + varlen KDA + lazy fused `kda_gdn_commit_and_verify_*` (halves KDA state DRAM writes on rollback).
+   - Batched-Steel causal MLA SDPA (`1.88–2.12x` at `S=128..4096`) + Zero-Mul-256 `bsg=1` `mla_multilinear_fp8`.
+   - `P1` packed vector-gate KDA prefill (`kernels/gated_delta.py`, `1.87x` on `T=2048` single-layer -> **`+21.9%` e2e 2K prefill, `+21.5%` e2e 32K prefill**).
+3. **Router & MoE (`rows/router.py`, `rows/moe.py`)**:
+   - Register-only `group_router_rows` (`10.2 -> 3.5 us`, dead `tg_score[512]` removed) + 1-launch fused `group_router_dedup_rows` emitting packed LPT `(cnt DESC, exp ASC)` `u_meta`.
+   - Bisection finding: `2-PSO` / `atomic_uint` work-stealing `rows/moe.py` regressed cold 68-layer DRAM by `+4.3..+12.6 ms`; restored lean `9e90dde` `rows/moe.py` with surgical wins: `_DC_TMAX_CAP=2` (`hdq=1` for `B>=2`), `threadgroup bfloat16_t dn_s[NPAIR*4]` (halves TG mem), and packed LPT `u_meta`.
+4. **D1 Fused Q4-Dense MTP Drafter (`mtp.py`)**:
+   - Fixed P0 `step_varlen_rows` bug; added `eh_norm_concat_rows`, `logits_argmax_prob`, `refresh_and_step0`, Q8 adapters, and dynamic 80K shortlist with 64-token sliding-window OOV fallback (`draft+refresh: 5.05 -> 4.07 ms`).
+5. **Speculative Scheduling, Exact `temp > 0` Spec & Serving (`spec_engine.py`, `suffix.py`, `generate.py`, `server.py`, `models/cache.py`)**:
+   - `A1`/`A2`: varlen speculative engine (`K_i=0` mixed greedy + non-greedy coexistence, `L_new=1` join piggybacking), Bellman trailing-draft pop, suffix guard, and `B<=12` zero-spill batch-K policy (`C=2 -> K=3 (B=8)`, `C=3 -> K=3 (B=12)`, `C=4 -> K=2 (B=12)`).
+   - Exact `temp > 0` speculative rejection sampling (`generate_step` & `BatchGenerator`), eliminating the `2x` non-greedy slowdown.
+   - `S1` serving wins: `TimeBudget(0.5)` early-break, zero-copy `ArraysCache` (preserving `lengths`/`left_padding` copy), hoisted fingerprint/SM, in-flight prefix coalescing, `lm_head` skip on non-MTP prefill, `mx.clear_cache()` guard, deferred finish sync, startup PSO warmup, and rolling 4K prefix checkpoints.
+
+### Verified Results (`512S1`, all greedy runs `0` token diffs & `0` logprob SHA-256 diffs vs `baseline.json`)
+- **Kernel unit tests**: `bench/rows_fp8_test.py`, `bench/rows_moe_test.py`, `bench/verify_kernels_test.py`: all `SUMMARY: ALL PASS`.
+- **`bench/profile_verify_c1.py --e2e-only` (`fast_verify_forward` ms, vs `9e90dde`)**:
+  * `C1_L1`: `39.34` (`39.11`), `C1_L3`: **`48.68`** (`49.24`), `C1_L5`: `57.54` (`57.40`), `C1_L8`: **`68.81`** (`71.05`, **`-2.24 ms`**), **`C1_L9`: `77.76`** (`87.44`, **`-9.68 ms`**), **`C1_L10`: `80.74`** (`88.73`, **`-7.99 ms`**), **`C1_L12`: `89.10`** (`99.50`, **`-10.40 ms`**), **`C1_L16`: `114.62`** (`121.30`, **`-6.68 ms`**), **`C4_L3`: `98.01`** (`106.02`, **`-8.01 ms`**).
+- **`bench/batch_dec.py --C 1,2,3,4 --tokens 128 --reps 3 --mode batchgen` (`~/science/runs/batchgen_phaseA_final.json`)**:
+  * **`C=1`**: **`50.86 tok/s`** (`54.97 ms/step`, `317.9 GB`, vs `50.47`) — `exact_tok=True exact_lp32=True`
+  * **`C=2`**: **`76.82 agg tok/s`** (`38.41/stream`, `79.55 ms/step`, `318.9 GB`, vs `75.86`) — `exact_tok=True exact_lp32=True`
+  * **`C=3`**: **`84.70 agg tok/s`** (`28.23/stream`, `106.26 ms/step`, `319.3 GB`, vs `77.06`, **`+9.9%`**) — `exact_tok=True exact_lp32=True`
+  * **`C=4`**: **`91.65 agg tok/s`** (`22.91/stream`, `109.39 ms/step`, `320.4 GB`, vs `84.13`, **`+8.9%`**) — `exact_tok=True exact_lp32=True`
+  * Fallbacks: `LINGSANTE_EAGLE3=0`: `C=1: 42.30 tok/s`, `exact=True`; `LINGSANTE_MTP=0`: direct `fastdecode B=1: 25.38 tok/s (39.41 ms)`, `batchgen C=1/4: 19.78/54.83 tok/s`, `exact=True`.
+- **Held-out 4-prompt decode**:
+  * `bench/eagle3_mtp_bench.py --dyn-th 0.55`: **`med=53.52 / w=53.49 tok/s`** (`cyc=57.21 ms`, `td=0 ld=0`, vs `53.13/52.68`); `@256`: **`med=51.28 / w=52.54 tok/s`** (`td=0 ld=0`, vs `50.72/51.78`).
+  * `bench/exact.py --capture` (`generate_step`, 4 prompts): **`median=53.15 tok/s`** (`medical_stemi: 51.08`, `chemistry_kmno4: 60.26`, `biology_lac: 55.22`, `medical_renal_pharm: 49.03`, vs `51.88` median), **`GATE PASS`**.
+- **Verification & Prefill**:
+  * `bench/server_exact_test.py`: `SUMMARY: ALL PASS`.
+  * `bench/ctx_exact_test.py --ctx 2048 --tokens 32 --mtp`: `SUMMARY: ALL PASS` (`fastdecode C=1/4: 24.53/63.09 agg tok/s`, **`+14.9% / +11.3%`** vs `21.35/56.68`).
+  * `EDGE_CASES_PASS`: `max_tokens=1/2`, early-break+continuation, `deepcopy` Turn-2 `M=1`/`M=3`, exact `temp=0.7` spec `C=1` (`33.13 tok/s` incl. prefill), mixed `C=2` greedy+`temp=0.7` coexistence + `remove(return_prompt_caches=True)` (`greedy exact=True`), `StopSequences`.
+  * `tools/run_eval.py gen`: `46.9–58.9 tok/s` across all 6 prompts; `tools/run_eval.py ppl`: identical `chunk 64 NLL 0.04473 (ppl 1.0458)`, `chunk 512 NLL 0.04646 (ppl 1.0476)`.
+  * `tools/run_eval.py bench --long`: **`prefill 2048: 5.3s (386.9 tok/s)`** (vs `6.5s / 317.4`, **`+21.9%`**); **`prefill 32768: 96.8s (338.6 tok/s)`** (vs `117.5s / 278.8`, **`+21.5%`**).
+- **Live HTTP `mlx_lm.server` (`512S1:8080`, `pid=36399`, `--decode-concurrency 4 --prompt-concurrency 1`)**:
+  * `bench/http_smoke.py --max-tokens 128`: `C=1`: **`34.67–48.76 tok/s`**; `C=4` concurrent: `423 tok in 5.44s` (**`77.72 agg tok/s`**, vs `72.46`, **`+7.3%`**), **`exact_vs_C1=True`**.
+  * `bench/http_smoke.py --max-tokens 256`: `C=1`: **`43.63–54.81 tok/s`**; `C=4` concurrent: `517 tok in 6.45s` (**`80.17 agg tok/s`**, vs `69.60`, **`+15.2%`**), **`exact_vs_C1=True`**.
+  * Non-greedy `temperature=0.7, top_p=0.95` `/v1/chat/completions`: HTTP `200`, prompt cache hit (`1/1` delta token on repeat), clean `server.log`.

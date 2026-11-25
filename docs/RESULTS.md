@@ -94,3 +94,27 @@ All numbers below are strictly **bit-exact greedy (`0` token diffs AND `0` logpr
   * `bench/http_smoke.py --base-url http://127.0.0.1:8080 --max-tokens 128`: `C=1`: `31.54–45.07 tok/s`; `C=4` concurrent: `423 tok in 5.84s` (**`72.46 agg tok/s`**), `exact_vs_C1=True`.
   * `bench/http_smoke.py --base-url http://127.0.0.1:8080 --max-tokens 256`: `C=1`: `39.54–52.05 tok/s`; `C=4` concurrent: `517 tok in 7.43s` (**`69.60 agg tok/s`**), `exact_vs_C1=True`.
   * Non-greedy `temperature=0.7` `/v1/chat/completions` sanity check: HTTP `200`, `24/25` cached prompt tokens, clean `server.log`.
+
+---
+
+## Phase A: Zero-Training Bit-Exact Kernel, Drafter, Scheduling & Serving Optimizations (`512S1`)
+
+All greedy numbers below are strictly **bit-exact (`0` token diffs AND `0` logprob SHA-256 diffs across 32 steps vs `~/science/runs/baseline.json`)**. See [docs/OPT_LOG.md](OPT_LOG.md) for the full optimization & bisection ledger.
+
+* **Held-out bit-exact decode (`512S1`)**:
+  * `bench/eagle3_mtp_bench.py --dyn-th 0.55` (`e3v4` + `D1` fused Q4-Dense MTP): **`53.52 med / 53.49 weighted tok/s`** (`cyc=57.21 ms`, `td=0 ld=0`; `@256`: **`51.28 med / 52.54 weighted tok/s`**).
+  * Production `generate_step` (`bench/exact.py --capture`, 4 prompts, `128` tok): **`53.15 median tok/s`** (`medical_stemi: 51.08`, `chemistry_kmno4: 60.26`, `biology_lac: 55.22`, `medical_renal_pharm: 49.03`, vs `51.88` before), **`GATE PASS`**.
+* **Production `BatchGenerator` (`bench/batch_dec.py --C 1,2,3,4 --tokens 128 --reps 3 --mode batchgen`, `batchgen_phaseA_final.json`)**:
+  * **`C=1`**: **`50.86 tok/s`** (`54.97 ms/step`, `317.9 GB`, vs `50.47` / stock `15.05`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=2`**: **`76.82 agg tok/s`** (`38.41/stream`, `79.55 ms/step`, `318.9 GB`, vs `75.86`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=3`**: **`84.70 agg tok/s`** (`28.23/stream`, `106.26 ms/step`, `319.3 GB`, vs `77.06`, **`+9.9%`**), `exact_tok=True`, `exact_lp32=True`
+  * **`C=4`**: **`91.65 agg tok/s`** (`22.91/stream`, `109.39 ms/step`, `320.4 GB`, vs `84.13`, **`+8.9%`**), `exact_tok=True`, `exact_lp32=True`
+* **Roofline & Prefill (`512S1`)**:
+  * `fast_verify_forward` `B=9..12` spill cliff eliminated: `C1_L9: 87.44 -> 77.76 ms (-9.68 ms)`, `C1_L12: 99.50 -> 89.10 ms (-10.40 ms)`, `C4_L3: 106.02 -> 98.01 ms (-8.01 ms)`.
+  * `P1` packed vector-gate KDA prefill (`tools/run_eval.py bench --long`): `2048` tok **`5.3s = 386.9 tok/s`** (vs `6.5s / 317.4`, **`+21.9%`**); `32768` tok **`96.8s = 338.6 tok/s`** (vs `117.5s / 278.8`, **`+21.5%`**).
+  * Long-context MLA (`bench/ctx_exact_test.py --ctx 2048 --tokens 32 --mtp`): `ALL PASS`, `fastdecode C=1/4 = 24.53 / 63.09 agg tok/s` (**`+14.9% / +11.3%`**).
+* **Verification & Serving (`512S1:8080`, `mlx_lm.server --decode-concurrency 4 --prompt-concurrency 1`)**:
+  * `rows_fp8_test`, `rows_moe_test`, `verify_kernels_test`, `server_exact_test`, `ctx_exact_test`, `EDGE_CASES_PASS` (incl. exact `temp=0.7` spec + mixed `C=2` greedy/`temp=0.7` coexistence + `StopSequences`), `run_eval.py ppl` (`0.04473` / `0.04646`): **ALL PASS**.
+  * `bench/http_smoke.py --max-tokens 128`: `C=1`: **`34.67–48.76 tok/s`**; `C=4` concurrent: `423 tok in 5.44s` (**`77.72 agg tok/s`**, vs `72.46`, **`+7.3%`**), **`exact_vs_C1=True`**.
+  * `bench/http_smoke.py --max-tokens 256`: `C=1`: **`43.63–54.81 tok/s`**; `C=4` concurrent: `517 tok in 6.45s` (**`80.17 agg tok/s`**, vs `69.60`, **`+15.2%`**), **`exact_vs_C1=True`**.
+  * Non-greedy `temperature=0.7, top_p=0.95` `/v1/chat/completions`: HTTP `200`, exact rejection-sampling spec, prompt-cache reuse (`1/1` delta token on repeat), clean `server.log`.

@@ -74,7 +74,7 @@ _PRE_SRC = r"""
       beta_out[size_t(b) * NH + h] = glue_sigmoid(static_cast<float>(b_raw[size_t(b) * NH + h]));
     }
 
-    bfloat4 qx4 = active ? *(const device bfloat4*)(q_raw + row_off + c0) : bfloat4(0.0f);
+    bfloat4 qx4 = active ? *(const device bfloat4*)(q_raw + row_off + c0) : bfloat4(float4(0.0f));
     bfloat4 qp0 = *(const device bfloat4*)(cs0_r + c0);
     bfloat4 qp1 = *(const device bfloat4*)(cs0_r + PROJ + c0);
     bfloat4 qp2 = *(const device bfloat4*)(cs0_r + 2 * PROJ + c0);
@@ -82,7 +82,7 @@ _PRE_SRC = r"""
     *(device bfloat4*)(ns0_r + PROJ + c0) = qp2;
     *(device bfloat4*)(ns0_r + 2 * PROJ + c0) = qx4;
 
-    bfloat4 kx4 = active ? *(const device bfloat4*)(k_raw + row_off + c0) : bfloat4(0.0f);
+    bfloat4 kx4 = active ? *(const device bfloat4*)(k_raw + row_off + c0) : bfloat4(float4(0.0f));
     bfloat4 kp0 = *(const device bfloat4*)(cs1_r + c0);
     bfloat4 kp1 = *(const device bfloat4*)(cs1_r + PROJ + c0);
     bfloat4 kp2 = *(const device bfloat4*)(cs1_r + 2 * PROJ + c0);
@@ -90,7 +90,7 @@ _PRE_SRC = r"""
     *(device bfloat4*)(ns1_r + PROJ + c0) = kp2;
     *(device bfloat4*)(ns1_r + 2 * PROJ + c0) = kx4;
 
-    bfloat4 vx4 = active ? *(const device bfloat4*)(v_raw + row_off + c0) : bfloat4(0.0f);
+    bfloat4 vx4 = active ? *(const device bfloat4*)(v_raw + row_off + c0) : bfloat4(float4(0.0f));
     bfloat4 vp0 = *(const device bfloat4*)(cs2_r + c0);
     bfloat4 vp1 = *(const device bfloat4*)(cs2_r + PROJ + c0);
     bfloat4 vp2 = *(const device bfloat4*)(cs2_r + 2 * PROJ + c0);

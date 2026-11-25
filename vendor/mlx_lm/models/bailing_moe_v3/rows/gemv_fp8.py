@@ -730,23 +730,20 @@ def _fp8_cfg(N: int, K: int, B: int, is_swiglu: bool = False):
     else:
         if N == 4096:
             # T5: avoid 128-TG (1.6 waves) & 256-TG (3.2 waves) 80-core tail underfill!
-            if B <= 4:
-                bsg, bm_m, tm = 1, 4, 2  # 512 TGs (6.4 waves)
-            elif B == 5:
-                bsg, bm_m, tm = 1, 4, 4  # 256 TGs, 31us (beats 35us)
-            elif B <= 12:
-                bsg, bm_m, tm = 1, 4, 2  # 512 TGs, bsg=1
+            # B<=12 use bm_m=4, tm=2 (512 TGs, b_reg=12, zero tg_acc spill); B=13..16 use bm_m=8, tm=2.
+            if B <= 12:
+                bsg, bm_m, tm = 1, 4, 2
             elif B <= 16:
-                bsg, bm_m, tm = 1, 8, 2  # 256 TGs, bsg=1 + br=12 (88us vs 95us)
+                bsg, bm_m, tm = 1, 8, 2
             else:
                 bsg, bm_m, tm = 2, 4, 2
         else:
-            if B <= 7:
-                bsg, bm_m, tm = 1, 4, 4  # 680-720 GB/s across B=1..7!
+            if B <= 4:
+                bsg, bm_m, tm = 1, 4, 4  # b_reg=4, zero tg_acc spill across B=1..4
             elif B <= 12:
-                bsg, bm_m, tm = 1, 4, 2  # B=8: 258us, B=9: 269us, B=12: 309us (zero tg_acc!)
+                bsg, bm_m, tm = 1, 4, 2  # b_reg=12, zero tg_acc spill across B=5..12
             elif B <= 16:
-                bsg, bm_m, tm = 1, 8, 2  # 422-431us at B=16 (vs 481us before!)
+                bsg, bm_m, tm = 1, 8, 2  # 425us at B=16 (vs 483us bsg=2)
             else:
                 bsg, bm_m, tm = 2, 4, 2
     if N < tm:

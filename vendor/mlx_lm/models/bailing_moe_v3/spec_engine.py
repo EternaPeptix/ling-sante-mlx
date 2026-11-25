@@ -13,7 +13,13 @@ from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache, make_prompt_
 from . import verify_decode as _vd
 from .mtp import BailingMTPLayer
 from .suffix import SuffixMatcher
-from .verify_decode import can_fast_verify, commit_verify_cache, fast_verify_forward, make_verify_cache
+from .verify_decode import (
+    can_fast_verify,
+    commit_verify_cache,
+    fast_verify_forward,
+    make_verify_cache,
+    materialize_lazy_kda,
+)
 
 
 def _has_varlen_verify() -> bool:
@@ -24,7 +30,7 @@ def _has_varlen_verify() -> bool:
 
 
 def _varlen_bmax() -> int:
-    return max(4, min(24, int(os.environ.get("LINGSANTE_VARLEN_BMAX", "8"))))
+    return max(4, min(24, int(os.environ.get("LINGSANTE_VARLEN_BMAX", "12"))))
 
 
 def _use_mtp_suffix() -> bool:
@@ -96,11 +102,11 @@ def mtp_k_for_batch(C: int, mtp: BailingMTPLayer | None = None) -> int:
         return max(1, int(os.environ.get("LINGSANTE_MTP_K1", str(cfg.get("fixed_K1", 4)))))
     if "LINGSANTE_MTP_KB" in os.environ:
         return max(0, int(os.environ["LINGSANTE_MTP_KB"]))
-    # Dodge B>=9 FP8 bsg=2 cliff: C=2 -> K=2 (B=6) or dyn_step K<=3 (B<=8); C=3,4 -> K=1 (B=6,8).
+    # Stay within B <= bmax (default 12, zero-spill FP8 bsg=1 regime):
+    # With EAGLE-3 dyn_step: C=2 -> K=3 (B=8), C=3 -> K=3 (B=12), C=4 -> K=2 (B=12).
     bmax = _varlen_bmax()
-    if C >= 3:
-        return max(1, (bmax // C) - 1)
-    return max(1, min(int(cfg.get("fixed_KB", 2)), (bmax // C) - 1))
+    k_hi = 3 if cfg.get("draft_mode") == "dyn_step" else int(cfg.get("fixed_KB", 2))
+    return max(1, min(k_hi, (bmax // C) - 1))
 
 
 def mtp_c1_policy(mtp: BailingMTPLayer) -> tuple[str, int, float, float]:
@@ -379,6 +385,7 @@ def mtp_extract_from_vcache(
     copy_kv: bool = True,
 ) -> list:
     """Extract a single-stream standard `prompt_cache` from `vcache`."""
+    materialize_lazy_kda(vcache)
     out = []
     for layer, c in zip(model.model.layers, vcache):
         if layer.is_linear:
@@ -412,6 +419,7 @@ def mtp_extract_from_vcache(
 
 def _snapshot_stream_vcache(model, vcache: list, idx: int, C: int) -> list:
     """Zero-copy snapshot of one stream's KDA slices & MLA KVCache reference prior to contraction."""
+    materialize_lazy_kda(vcache)
     snap = []
     for layer, c in zip(model.model.layers, vcache):
         if layer.is_linear:
@@ -461,6 +469,8 @@ def mtp_vcache_to_standard(model, vcache: list, C: int) -> list:
 
 def mtp_extend_vcache(model, vc_a: list, C_a: int, vc_b: list, C_b: int) -> list:
     """Zero-copy merge of two verification caches `vc_a` (C_a) and `vc_b` (C_b)."""
+    materialize_lazy_kda(vc_a)
+    materialize_lazy_kda(vc_b)
     C_tot = C_a + C_b
     out = []
     for layer, ca, cb in zip(model.model.layers, vc_a, vc_b):
@@ -519,12 +529,12 @@ def mtp_cancel_inflight(inflight: dict, mtp_caches: list[KVCache]) -> None:
             mc.trim(tr)
 
 
-def _commit_verify_any(vcache: list, rb: dict, ncs: int | Sequence[int]) -> None:
+def _commit_verify_any(vcache: list, rb: dict, ncs: int | Sequence[int], *, lazy: bool = False) -> None:
     """Dispatch commit to varlen commit helper if `rb` is varlen, else standard `commit_verify_cache`."""
     if rb.get("Ls") is not None and hasattr(_vd, "commit_verify_cache_varlen"):
-        _vd.commit_verify_cache_varlen(vcache, rb, ncs)
+        _vd.commit_verify_cache_varlen(vcache, rb, ncs, lazy=lazy)
     else:
-        commit_verify_cache(vcache, rb, ncs)
+        commit_verify_cache(vcache, rb, ncs, lazy=lazy)
 
 
 def _verify_eval_targets(
@@ -984,7 +994,7 @@ def mtp_generate_step(
                         suffix_matcher._last_tail_len = 0
                     suffix_matcher.extend(pred_row[:nc])
 
-                commit_verify_cache(prompt_cache, rb, nc)
+                commit_verify_cache(prompt_cache, rb, nc, lazy=True)
                 K_lim_next = None if max_tokens < 0 else max(0, max_tokens - (n + n_take) - 1)
                 draft_q_next: list[mx.array] | None = None
                 if sampling_spec is not None:
@@ -1028,7 +1038,7 @@ def mtp_generate_step(
                     else cur_arr[:, None]
                 )
                 logits_next, hidden_next, rb_next = fast_verify_forward(
-                    model, inp_next, prompt_cache, return_hidden=True, return_rollback=True, capture_layers=lids
+                    model, inp_next, prompt_cache, return_hidden=True, return_rollback=True, capture_layers=lids, lazy_kda=True
                 )
                 preds_next, lp_next = _logits_to_preds(logits_next)
                 ev_n = _verify_eval_targets(
@@ -1602,7 +1612,9 @@ class LingSanteSpecBatch:
     def _use_varlen_now(self, C_act: int, has_joins: bool) -> bool:
         if not _has_varlen_verify():
             return False
-        return has_joins or C_act > 1 or (C_act == 1 and not self.spec_eligible[0])
+        if os.environ.get("LINGSANTE_VARLEN_ALWAYS", "0") not in ("0", ""):
+            return has_joins or C_act > 1 or (C_act == 1 and not self.spec_eligible[0])
+        return has_joins or (not all(self.spec_eligible[:C_act]))
 
     def _launch_cycle(self, gen_batch) -> None:
         C_act = len(self.cur_toks)
@@ -1748,6 +1760,7 @@ class LingSanteSpecBatch:
             return_hidden=True,
             return_rollback=True,
             capture_layers=lids,
+            lazy_kda=True,
         )
         # Ensure rb carries Ls and row_starts for commit/cancel
         if "Ls" not in rb:
@@ -1957,7 +1970,14 @@ class LingSanteSpecBatch:
         after0_offs = list(self.mtp_exact_offs)
 
         # Commit verified prefix lengths to target KDA + MLA caches
-        commit_verify_cache(self.vcache, rb, ncs)
+        can_lazy = (
+            (not fin_indices)
+            and (len(keep) == C)
+            and prefetch
+            and (not self.pending_joins)
+            and max(gen_batch.max_tokens[i] - gen_batch._num_tokens[i] for i in range(C)) > 1
+        )
+        commit_verify_cache(self.vcache, rb, ncs, lazy=can_lazy)
 
         # S1: Snapshot finished streams' refs BEFORE contracting vcache, deferring mx.contiguous/eval
         # until AFTER the next async cycle is launched for surviving streams!
@@ -2091,7 +2111,7 @@ class LingSanteSpecBatch:
                     else cur_arr[:, None]
                 )
                 logits_next, hidden_next, rb_next = fast_verify_forward(
-                    self.model, inp_next, self.vcache, return_hidden=True, return_rollback=True, capture_layers=lids
+                    self.model, inp_next, self.vcache, return_hidden=True, return_rollback=True, capture_layers=lids, lazy_kda=True
                 )
                 preds_next, lp_next = _logits_to_preds(logits_next)
                 ev_n = _verify_eval_targets(
@@ -2306,7 +2326,15 @@ class LingSanteSpecBatch:
             for ji, pj in enumerate(pjs)
         ]
 
-        _commit_verify_any(self.vcache, rb, ncs)
+        can_lazy_v = (
+            (not fin_indices)
+            and (len(keep_all) == C_tot)
+            and prefetch
+            and (not self.pending_joins)
+            and any(elig_all)
+            and max(gen_batch.max_tokens[i] - gen_batch._num_tokens[i] for i in range(C_tot)) > 1
+        )
+        _commit_verify_any(self.vcache, rb, ncs, lazy=can_lazy_v)
 
         fin_snaps: dict[int, tuple] = {}
         fin_tokens: dict[int, list[int]] = {}
@@ -2391,10 +2419,10 @@ class LingSanteSpecBatch:
                     after0_prev=after0_kept,
                 )
             else:
-                # Shrunk to C=1 (greedy or sampled)!
+                # Homogeneous batch (C_new >= 1, greedy or sampled) -> zero-sync GPU-chained uniform path!
                 K_lim = max(0, max_rem_next - 1)
                 draft_q_next = None
-                if self.sampling_specs[0] is not None:
+                if any(sp is not None for sp in self.sampling_specs):
                     draft_mat_next, new_a0, draft_q_next = _sync_and_chain_mtp_mixed(
                         self.mtp,
                         h_eff_kept,
@@ -2404,7 +2432,7 @@ class LingSanteSpecBatch:
                         self.mtp_caches,
                         after0_kept,
                         sampling_specs=self.sampling_specs,
-                        C=1,
+                        C=C_new,
                         K_limit=K_lim,
                         use_q4_head=True,
                     )
@@ -2417,10 +2445,10 @@ class LingSanteSpecBatch:
                         ncs_kept,
                         self.mtp_caches,
                         after0_kept,
-                        C=1,
+                        C=C_new,
                         K_limit=K_lim,
                         use_q4_head=True,
-                        suffix_matcher=self.suffix_matchers[0],
+                        suffix_matcher=self.suffix_matchers[0] if C_new == 1 else None,
                     )
                 K_next = int(draft_mat_next.shape[1])
                 if K_next > 0:
@@ -2434,6 +2462,7 @@ class LingSanteSpecBatch:
                 logits_next, hidden_next, rb_next = fast_verify_forward(
                     self.model, inp_next, self.vcache, return_hidden=True, return_rollback=True,
                     capture_layers=getattr(self.mtp, "_feat_layers", None),
+                    lazy_kda=True,
                 )
                 preds_next, lp_next = _logits_to_preds(logits_next)
                 ev_n = _verify_eval_targets(
@@ -2583,8 +2612,9 @@ def _draft_steps_from_logits(
 
     if draft_mode == "dyn_step" and C == 1:
         r_star, t_draft, e_p_next, p0_drop, skip_sync_th, use_rr = _a2_params(dyn_th, p1_min)
+        use_rtr_budget = os.environ.get("LINGSANTE_ROUTER_BUDGET", "0") not in ("0", "")
         d0_arr, p0_arr = _step_top1_and_prob(dl0)
-        r_inds0 = getattr(mtp, "_last_router_inds", None)
+        r_inds0 = getattr(mtp, "_last_router_inds", None) if use_rtr_budget else None
         need_d0_host = suffix_matcher is not None or anchor_tok_int is not None
         eval0 = [p0_arr, d0_arr] if need_d0_host else [p0_arr]
         if r_inds0 is not None:
@@ -2595,11 +2625,13 @@ def _draft_steps_from_logits(
         d0_int = int(d0_arr[0].item()) if need_d0_host else -1
         seen_toks = {anchor_tok_int} if anchor_tok_int is not None else set()
         seen_mask = 0
-        du72_0, seen_mask = _update_router_mask(mtp, 0, seen_mask)
+        if r_inds0 is not None:
+            _, seen_mask = _update_router_mask(mtp, 0, seen_mask)
 
         # A2 K=0 drop gate: skip verifying d0 when p0 is below marginal verify break-even!
+        # Step 0 has no prior draft to measure expert overlap against -> pass du72=None!
         _, tau_dr0 = _thresholds_for_step(
-            2, du72_0, d0_int in seen_toks, dyn_th=dyn_th, r_star=r_star, t_draft=t_draft, e_p_next=e_p_next, use_rr=use_rr
+            2, None, d0_int in seen_toks, dyn_th=dyn_th, r_star=r_star, t_draft=t_draft, e_p_next=e_p_next, use_rr=use_rr
         )
         if p0 < p0_drop:
             return mx.zeros((1, 0), dtype=mx.uint32)
@@ -2699,12 +2731,14 @@ def _draft_steps_from_logits(
                 mtp, d_prev, h_in_next, cache_arg, C=1, use_q4_head=use_q4_head
             )
             h_in = h_in_next
-            r_indsk = getattr(mtp, "_last_router_inds", None)
+            r_indsk = getattr(mtp, "_last_router_inds", None) if use_rtr_budget else None
             ev_k = [pk_arr] if r_indsk is None else [pk_arr, r_indsk]
             mx.eval(*ev_k)
 
             pk_v = float(pk_arr[0].item())
-            du72_k, seen_mask = _update_router_mask(mtp, 0, seen_mask)
+            du72_k = None
+            if r_indsk is not None:
+                du72_k, seen_mask = _update_router_mask(mtp, 0, seen_mask)
             cum_q = cum_q * pk_v
             B_next = len(cols) + 2
             tau_vk, tau_dk = _thresholds_for_step(
@@ -2863,10 +2897,10 @@ def _chain_mtp_drafts_varlen(
         d0 = int(d0_vals[idx])
         du72 = None
         if r_inds0 is not None:
-            du72, seen_mask = _update_router_mask(mtp, idx, seen_mask)
+            _, seen_mask = _update_router_mask(mtp, idx, seen_mask)
         B_next = C + slots_used + 1
         _, tau_d = _thresholds_for_step(
-            B_next, du72, d0 in seen_toks, dyn_th=dyn_th, r_star=r_eff, t_draft=t_draft, e_p_next=e_p_next, use_rr=use_rr
+            B_next, None, d0 in seen_toks, dyn_th=dyn_th, r_star=r_eff, t_draft=t_draft, e_p_next=e_p_next, use_rr=use_rr
         )
         if specs[s] is None and p0 < p0_drop:
             continue
@@ -3211,6 +3245,7 @@ def _logits_to_preds(logits: mx.array):
 
 def _contract_verify_cache(model, vcache: list, keep: list[int]):
     """Shrink active slots in `vcache` to indices in `keep` after one or more streams finish."""
+    materialize_lazy_kda(vcache)
     C_new = len(keep)
     keep_arr = mx.array(keep, dtype=mx.int32)
     for li, layer in enumerate(model.model.layers):
@@ -3377,7 +3412,7 @@ def run_mtp_spec_greedy(
         h_eff_list = _apply_feat_fuse_consumed(mtp, hidden, rb.get("captured"), ncs)
 
         # Commit current active batch, then contract finished streams before MTP/next verify
-        commit_verify_cache(vcache, rb, ncs)
+        commit_verify_cache(vcache, rb, ncs, lazy=(len(keep) == C_act))
         old_active_orig = active_orig
         if len(keep) < C_act:
             _contract_verify_cache(model, vcache, keep)
@@ -3418,7 +3453,7 @@ def run_mtp_spec_greedy(
             else cur_arr[:, None]
         )
         logits_next, hidden_next, rb_next = fast_verify_forward(
-            model, inp_next, vcache, return_hidden=True, return_rollback=True, capture_layers=lids
+            model, inp_next, vcache, return_hidden=True, return_rollback=True, capture_layers=lids, lazy_kda=True
         )
         preds_next, lp_next = _logits_to_preds(logits_next)
         mx.async_eval(

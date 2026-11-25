@@ -5,11 +5,18 @@ import mlx.core as mx
 
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 
-from .rows.gemv_fp8 import gemv_lin, gemv_lin_multi, gemv_lin_res, gemv_lin_swiglu
+from .rows.gemv_fp8 import (
+    gemv_kda_qkvfgb_merged_rows,
+    gemv_lin,
+    gemv_lin_multi,
+    gemv_lin_res,
+    gemv_lin_swiglu,
+    gemv_router_se_swiglu_rows,
+)
 from .rows.kda import kda_gdn_norm_gate_rows, kda_pre_rows
 from .rows.mla import mla_layer_rows
 from .rows.moe import moe_down_combine_rows, moe_gate_up_swiglu_rows
-from .rows.router import gate_rows
+from .rows.router import group_router_dedup_rows, group_router_rows
 
 _FAST_FLUSH_EVERY = int(os.environ.get("LINGSANTE_FAST_FLUSH", "4"))
 
@@ -67,23 +74,38 @@ def can_fast_decode(model, inputs, cache) -> bool:
 def fast_decode_forward(model, inputs, cache):
     """Run all 72 decoder layers + final norm + lm_head for (B, 1) with 1 <= B <= 4."""
     inner = model.model
+    layers = inner.layers
+    n_layers = len(layers)
     x = inner.word_embeddings(inputs)[:, 0, :]
+    x_pss = None
+    use_kda_in_pss = os.environ.get("LINGSANTE_PARTSS_KDA_IN", "0") not in ("0", "")
 
-    for li, (layer, c) in enumerate(zip(inner.layers, cache)):
-        h_in = mx.fast.rms_norm(x, layer.input_layernorm.weight, layer.input_layernorm.eps)
+    for li, (layer, c) in enumerate(zip(layers, cache)):
+        ln_in = layer.input_layernorm
+        is_dense_mlp = not hasattr(layer.mlp, "switch_mlp")
         if layer.is_linear:
             attn = layer.attention
-            q_r, k_r, v_r, f_r, g_r, b_r = gemv_lin_multi(
-                h_in,
-                [
-                    attn.q_proj,
-                    attn.k_proj,
-                    attn.v_proj,
-                    attn.f_proj,
-                    attn.g_proj,
-                    attn.b_proj,
-                ],
-            )
+            use_pss_in = (x_pss is not None) and use_kda_in_pss
+            if hasattr(attn, "_w_qkvfg"):
+                if use_pss_in:
+                    q_r, k_r, v_r, f_r, g_r, b_r = gemv_kda_qkvfgb_merged_rows(
+                        x, attn._w_qkvfg, attn._s_qkvfg, attn.b_proj.weight,
+                        part_ss=x_pss, norm_w=ln_in.weight, norm_eps=ln_in.eps,
+                    )
+                else:
+                    h_in = mx.fast.rms_norm(x, ln_in.weight, ln_in.eps)
+                    q_r, k_r, v_r, f_r, g_r, b_r = gemv_kda_qkvfgb_merged_rows(
+                        h_in, attn._w_qkvfg, attn._s_qkvfg, attn.b_proj.weight
+                    )
+            else:
+                qkv_mods = [attn.q_proj, attn.k_proj, attn.v_proj, attn.f_proj, attn.g_proj, attn.b_proj]
+                if use_pss_in:
+                    q_r, k_r, v_r, f_r, g_r, b_r = gemv_lin_multi(
+                        x, qkv_mods, part_ss=x_pss, norm_w=ln_in.weight, norm_eps=ln_in.eps
+                    )
+                else:
+                    h_in = mx.fast.rms_norm(x, ln_in.weight, ln_in.eps)
+                    q_r, k_r, v_r, f_r, g_r, b_r = gemv_lin_multi(h_in, qkv_mods)
             q, k, v, g, beta, ns0, ns1, ns2 = kda_pre_rows(
                 q_r,
                 k_r,
@@ -118,32 +140,53 @@ def fast_decode_forward(model, inputs, cache):
             c[2] = ns2
             c[3] = ns3
             c.advance(1)
-            h_post = gemv_lin_res(ov, attn.o_proj, x)
+            if is_dense_mlp:
+                h_post, pss_o = gemv_lin_res(ov, attn.o_proj, x, return_part_ss=True)
+            else:
+                h_post = gemv_lin_res(ov, attn.o_proj, x)
+                pss_o = None
         else:
-            h_post = mla_layer_rows(h_in, x, layer.attention, c)
+            if x_pss is not None:
+                res_mla = mla_layer_rows(
+                    x, x, layer.attention, c,
+                    part_ss=x_pss, norm_w=ln_in.weight, norm_eps=ln_in.eps,
+                    return_part_ss=is_dense_mlp,
+                )
+            else:
+                h_in = mx.fast.rms_norm(x, ln_in.weight, ln_in.eps)
+                res_mla = mla_layer_rows(h_in, x, layer.attention, c, return_part_ss=is_dense_mlp)
+            if is_dense_mlp:
+                h_post, pss_o = res_mla
+            else:
+                h_post, pss_o = res_mla, None
 
-        mlp_in = mx.fast.rms_norm(
-            h_post,
-            layer.post_attention_layernorm.weight,
-            layer.post_attention_layernorm.eps,
-        )
+        ln_post = layer.post_attention_layernorm
         mlp = layer.mlp
+        need_next_pss = (li + 1 < n_layers) and (not layers[li + 1].is_linear or use_kda_in_pss)
         if hasattr(mlp, "switch_mlp"):
+            mlp_in = mx.fast.rms_norm(h_post, ln_post.weight, ln_post.eps)
             gate = mlp.gate
-            inds, wts = gate_rows(
-                mlp_in,
-                gate.weight,
-                gate.expert_bias,
-                top_k=gate.top_k,
-                n_group=gate.n_group,
-                topk_group=gate.topk_group,
-                routed_scaling_factor=gate.routed_scaling_factor,
-            )
             se = mlp.shared_experts
-            sh = gemv_lin(
-                gemv_lin_swiglu(mlp_in, se.gate_proj, se.up_proj),
-                se.down_proj,
-            )
+            logits_r, se_mid = gemv_router_se_swiglu_rows(mlp_in, gate.weight, se.gate_proj, se.up_proj)
+            if x.shape[0] >= 2:
+                inds, wts, dedup = group_router_dedup_rows(
+                    logits_r,
+                    gate.expert_bias,
+                    top_k=gate.top_k,
+                    n_group=gate.n_group,
+                    topk_group=gate.topk_group,
+                    routed_scaling_factor=gate.routed_scaling_factor,
+                )
+            else:
+                inds, wts = group_router_rows(
+                    logits_r,
+                    gate.expert_bias,
+                    top_k=gate.top_k,
+                    n_group=gate.n_group,
+                    topk_group=gate.topk_group,
+                    routed_scaling_factor=gate.routed_scaling_factor,
+                )
+                dedup = None
             sw = mlp.switch_mlp
             h_mid = moe_gate_up_swiglu_rows(
                 mlp_in,
@@ -152,7 +195,9 @@ def fast_decode_forward(model, inputs, cache):
                 sw.up_proj.weight,
                 sw.up_proj.scales,
                 inds,
+                dedup=dedup,
             )
+            sh = gemv_lin(se_mid, se.down_proj)
             x = moe_down_combine_rows(
                 h_mid,
                 sw.down_proj.weight,
@@ -161,10 +206,23 @@ def fast_decode_forward(model, inputs, cache):
                 wts,
                 shared=sh,
                 residual=h_post,
+                dedup=dedup,
             )
+            x_pss = None
         else:
-            mid = gemv_lin_swiglu(mlp_in, mlp.gate_proj, mlp.up_proj)
-            x = gemv_lin_res(mid, mlp.down_proj, h_post)
+            if pss_o is not None:
+                mid = gemv_lin_swiglu(
+                    h_post, mlp.gate_proj, mlp.up_proj,
+                    part_ss=pss_o, norm_w=ln_post.weight, norm_eps=ln_post.eps,
+                )
+            else:
+                mlp_in = mx.fast.rms_norm(h_post, ln_post.weight, ln_post.eps)
+                mid = gemv_lin_swiglu(mlp_in, mlp.gate_proj, mlp.up_proj)
+            if need_next_pss:
+                x, x_pss = gemv_lin_res(mid, mlp.down_proj, h_post, return_part_ss=True)
+            else:
+                x = gemv_lin_res(mid, mlp.down_proj, h_post)
+                x_pss = None
 
         if _FAST_FLUSH_EVERY > 0 and (li + 1) % _FAST_FLUSH_EVERY == 0:
             mx.async_eval(x)
