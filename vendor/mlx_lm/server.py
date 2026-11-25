@@ -7,6 +7,8 @@ import hashlib
 import io
 import json
 import logging
+import math
+import os
 import pickle
 import platform
 import socket
@@ -27,6 +29,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -55,9 +58,27 @@ from .utils import (
 )
 
 
+_SYSTEM_FINGERPRINT: Optional[str] = None
+_EMPTY_STOP_SM: Optional[TextStateMachine] = None
+
+
 def get_system_fingerprint():
-    gpu_arch = mx.device_info()["architecture"]
-    return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+    global _SYSTEM_FINGERPRINT
+    if _SYSTEM_FINGERPRINT is None:
+        gpu_arch = mx.device_info()["architecture"]
+        _SYSTEM_FINGERPRINT = (
+            f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+        )
+    return _SYSTEM_FINGERPRINT
+
+
+def _get_stop_sm(stop_words: Sequence[str]) -> TextStateMachine:
+    global _EMPTY_STOP_SM
+    if not stop_words:
+        if _EMPTY_STOP_SM is None:
+            _EMPTY_STOP_SM = TextStateMachine.from_stop_words(())
+        return _EMPTY_STOP_SM
+    return TextStateMachine.from_stop_words(stop_words)
 
 
 def _apply_stop_words(
@@ -546,6 +567,7 @@ class ResponseGenerator:
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
+        self._text_sm_cache: Tuple[Any, Optional[TextStateMachine]] = (None, None)
         self._stop = False
         self._generation_failed = False
         self._generation_thread = Thread(target=self._run_generate)
@@ -711,9 +733,9 @@ class ResponseGenerator:
                 initial_state = "reasoning"
         initial_state = tokenizer.response_initial_state or initial_state
 
-        # It is not a user message, or it has images (served sequentially), so
+        # It is not a user/tool message, or it has images (served sequentially), so
         # no segmentation needed.
-        if messages[-1]["role"] != "user" or vision is not None:
+        if messages[-1]["role"] not in ("user", "tool") or vision is not None:
             return prompt, [prompt], ["assistant"], initial_state, vision
 
         segments = []
@@ -749,10 +771,31 @@ class ResponseGenerator:
             if think_start >= 0:
                 tail_start = think_start
 
-        # Finalize the segments and return
+        # Finalize the segments with rolling 4K prefix checkpoints aligned to
+        # prefill_step_size multiples (preserves exact chunk sizes -> 100% bit-exact!).
         if sys_end < tail_start:
-            segments.append(prompt[sys_end:tail_start])
-            segment_types.append("user")
+            user_seg = prompt[sys_end:tail_start]
+            base_stride = int(os.environ.get("LINGSANTE_PREFIX_CKPT_STRIDE", "4096"))
+            step_sz = max(1, int(getattr(self.model_provider.cli_args, "prefill_step_size", 2048)))
+            if base_stride > 0 and len(user_seg) > base_stride:
+                # Align stride to an exact multiple of prefill_step_size so GEMM chunk sizes are unchanged.
+                stride = max(step_sz, ((base_stride + step_sz - 1) // step_sz) * step_sz)
+                max_ckpts = max(1, min(8, getattr(self.prompt_cache, "max_size", 10) // 2))
+                n_ckpts = (len(user_seg) - 1) // stride
+                if n_ckpts > max_ckpts:
+                    mult = math.ceil(n_ckpts / max_ckpts)
+                    stride = stride * mult
+                pos = 0
+                seg_len = len(user_seg)
+                while pos + stride < seg_len:
+                    segments.append(user_seg[pos : pos + stride])
+                    segment_types.append("user")
+                    pos += stride
+                segments.append(user_seg[pos:])
+                segment_types.append("user")
+            else:
+                segments.append(user_seg)
+                segment_types.append("user")
         if tail_start < len(prompt):
             segments.append(prompt[tail_start:])
             segment_types.append("assistant")
@@ -769,6 +812,108 @@ class ResponseGenerator:
             and self.cli_args.kv_bits is None
         )
 
+    def _warmup_default_model(self, stream) -> None:
+        """Pre-compile Metal PSOs across prefill & (C, L) decode/verify shapes before serving."""
+        if os.environ.get("LINGSANTE_SERVER_WARMUP", "1") in ("0", ""):
+            return
+        model = self.model_provider.model
+        if model is None:
+            return
+        t0 = time.perf_counter()
+        saved_rng = mx.array(mx.random.state[0])
+        mx.eval(saved_rng)
+        try:
+            with mx.stream(stream):
+                vocab = int(getattr(getattr(model, "args", None), "vocab_size", 1024))
+                tok_ids = [min(i + 1, max(1, vocab - 1)) for i in range(16)]
+                if getattr(model, "_lingsante_mtp_holder", None) is not None:
+                    from .models.bailing_moe_v3 import verify_decode as _vd
+                    from .models.bailing_moe_v3.spec_engine import (
+                        get_lingsante_mtp,
+                        mtp_target_prefill_hidden,
+                    )
+                    from .models.cache import KVCache
+
+                    mtp = get_lingsante_mtp(model)
+                    if mtp is not None:
+                        # 1. Prefill PSOs (chunked KDA/MLA/MoE + FeatFuse + MTP kv_append)
+                        c1 = make_prompt_cache(model)
+                        p16 = mx.array([tok_ids], dtype=mx.uint32)
+                        h16 = mtp_target_prefill_hidden(model, mtp, p16, c1)
+                        mc1 = KVCache()
+                        mtp.kv_append(p16[:, 1:], h16[:, :-1, :], mc1)
+                        mx.eval(h16, [c.state for c in c1], mc1.state)
+
+                        # 2. Verify & MTP decode PSOs across B=1, B=5 (dedup MoE), C=2 B=6, C=4 B=8
+                        vc1 = _vd.make_verify_cache(model, [c1])
+                        lids = getattr(mtp, "_feat_layers", None)
+                        for L in (1, 5):
+                            inp = mx.array([tok_ids[:L]], dtype=mx.uint32)
+                            lg, hid, rb = _vd.fast_verify_forward(
+                                model, inp, vc1, return_hidden=True, return_rollback=True, capture_layers=lids
+                            )
+                            mx.eval(lg, hid)
+                            for mla_c in rb["mla"]:
+                                mla_c.trim(L)
+                        h_d, _ = mtp.step_rows(
+                            mx.array([tok_ids[0]], dtype=mx.uint32),
+                            h16[:, -1, :],
+                            mc1,
+                            C=1,
+                            L=1,
+                            use_q4_head=True,
+                        )
+                        mx.eval(h_d, mc1.state)
+                        del vc1, c1, mc1
+
+                        # Multi-stream verify PSOs (C=2, L=3 -> B=6; C=4, L=2 -> B=8) + optional varlen
+                        for C_w, L_w in ((2, 3), (4, 2)):
+                            cs = [make_prompt_cache(model) for _ in range(C_w)]
+                            p2 = mx.array([tok_ids[:2]], dtype=mx.uint32)
+                            for ci in cs:
+                                model.model(p2, cache=ci)
+                                mx.eval([x.state for x in ci])
+                            vcw = _vd.make_verify_cache(model, cs)
+                            inpw = mx.array([tok_ids[:L_w]] * C_w, dtype=mx.uint32)
+                            lg, hid, rb = _vd.fast_verify_forward(
+                                model, inpw, vcw, return_hidden=True, return_rollback=True, capture_layers=lids
+                            )
+                            mx.eval(lg, hid)
+                            if C_w == 2 and hasattr(_vd, "fast_verify_forward_varlen"):
+                                for mla_c in rb["mla"]:
+                                    for ci in mla_c:
+                                        ci.trim(L_w)
+                                lg_v, hid_v, _ = _vd.fast_verify_forward_varlen(
+                                    model,
+                                    mx.array(tok_ids[:5], dtype=mx.uint32),
+                                    vcw,
+                                    Ls=[3, 2],
+                                    return_hidden=True,
+                                    return_rollback=True,
+                                    capture_layers=lids,
+                                )
+                                mx.eval(lg_v, hid_v)
+                            del vcw, cs
+                else:
+                    c1 = make_prompt_cache(model)
+                    p4 = mx.array([tok_ids[:4]], dtype=mx.uint32)
+                    lg = model(p4, cache=c1)
+                    mx.eval(lg, [c.state for c in c1])
+                    lg1 = model(mx.array([[tok_ids[0]]], dtype=mx.uint32), cache=c1)
+                    mx.eval(lg1)
+                    del c1
+        except Exception as e:
+            logging.warning(f"Startup kernel warmup skipped: {e}")
+        finally:
+            try:
+                mx.random.state[0][:] = saved_rng
+                mx.eval(mx.random.state[0])
+            except Exception:
+                pass
+            gc.collect()
+            mx.clear_cache()
+        logging.info(f"Startup kernel warmup completed in {time.perf_counter() - t0:.2f}s")
+
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
         # sure that all generation runs in the same stream as the
@@ -777,6 +922,7 @@ class ResponseGenerator:
 
         # Load the default model if it is given
         self.model_provider.load_default()
+        self._warmup_default_model(generation_stream)
 
         current_model = None
         current_tokenizer = None
@@ -830,8 +976,12 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-                    text_sm = TextStateMachine.from_tokenizer(current_tokenizer)
+                    stop_sm = _get_stop_sm(args.stop_words)
+                    if self._text_sm_cache[0] is current_tokenizer:
+                        text_sm = self._text_sm_cache[1]
+                    else:
+                        text_sm = TextStateMachine.from_tokenizer(current_tokenizer)
+                        self._text_sm_cache = (current_tokenizer, text_sm)
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -954,22 +1104,33 @@ class ResponseGenerator:
                         and not r.end_of_prompt
                         and batch_results[r.uid]["segment_types"]
                     ]
-                    caches = batch_generator.extract_cache(eos_ids)
-                    for uid, (cache, cache_key) in caches.items():
-                        self.prompt_cache.insert_cache(
-                            self.model_provider.model_key,
-                            cache_key[:],
-                            cache,
-                            cache_type=batch_results[uid]["segment_types"].pop(),
-                        )
-                    del caches
+                    cache_inserted = False
+                    if eos_ids:
+                        caches = batch_generator.extract_cache(eos_ids)
+                        for uid, (cache, cache_key) in caches.items():
+                            self.prompt_cache.insert_cache(
+                                self.model_provider.model_key,
+                                cache_key[:],
+                                cache,
+                                cache_type=batch_results[uid]["segment_types"].pop(),
+                            )
+                            cache_inserted = True
+                        del caches
 
                     uids_to_finish = []
+                    valid_gen = []
                     for r in gen_responses:
                         result = batch_results.get(r.uid)
-                        if result is None:
-                            continue
+                        if result is not None:
+                            valid_gen.append((r, result))
+                    if valid_gen:
+                        tok_lps_arr = mx.stack([r.logprobs[r.token] for r, _ in valid_gen])
+                        mx.eval(tok_lps_arr)
+                        tok_lps = tok_lps_arr.tolist()
+                    else:
+                        tok_lps = []
 
+                    for (r, result), tok_lp in zip(valid_gen, tok_lps):
                         # Don't decode the final stop token
                         if r.finish_reason == "stop":
                             result["detokenizer"].finalize()
@@ -989,7 +1150,7 @@ class ResponseGenerator:
                             Response(
                                 text,
                                 r.token,
-                                r.logprobs[r.token].item(),
+                                tok_lp,
                                 finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,
@@ -1008,6 +1169,7 @@ class ResponseGenerator:
                                     r.prompt_cache,
                                     cache_type="assistant",
                                 )
+                                cache_inserted = True
                             else:
                                 uids_to_finish.append(r.uid)
                             del batch_results[r.uid]
@@ -1027,6 +1189,33 @@ class ResponseGenerator:
                                 cache,
                                 cache_type="assistant",
                             )
+                            cache_inserted = True
+
+                    # In-flight prefix coalescing: let queued requests hit newly inserted caches.
+                    if cache_inserted and batch_generator._unprocessed_sequences:
+                        def _on_coalesce(uid, new_hit, popped_segs):
+                            res = batch_results.get(uid)
+                            if res is not None:
+                                res["ctx"].prompt_cache_count = new_hit
+                                stypes = res["segment_types"]
+                                for _ in range(popped_segs):
+                                    if stypes:
+                                        stypes.pop()
+
+                        batch_generator.refresh_queued_caches(
+                            lambda full_prompt: self.prompt_cache.fetch_nearest_cache(
+                                current_model_key, full_prompt
+                            ),
+                            on_hit=_on_coalesce,
+                        )
+
+                    # Early-break TimeBudget(0.5) when new HTTP requests are waiting.
+                    if (
+                        not self._is_distributed
+                        and not drain_batch
+                        and not self.requests.empty()
+                    ):
+                        break
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
@@ -1059,8 +1248,12 @@ class ResponseGenerator:
             prompt, _, _, initial_state, vision = self._tokenize(
                 tokenizer, request, args
             )
-            stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-            text_sm = TextStateMachine.from_tokenizer(tokenizer)
+            stop_sm = _get_stop_sm(args.stop_words)
+            if self._text_sm_cache[0] is tokenizer:
+                text_sm = self._text_sm_cache[1]
+            else:
+                text_sm = TextStateMachine.from_tokenizer(tokenizer)
+                self._text_sm_cache = (tokenizer, text_sm)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -1871,11 +2064,12 @@ def _run_http_server(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
     server_class.address_family, _, _, _, server_address = next(iter(infos))
+    fingerprint = get_system_fingerprint()
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(
             response_generator,
-            system_fingerprint=get_system_fingerprint(),
+            system_fingerprint=fingerprint,
             *args,
             **kwargs,
         ),

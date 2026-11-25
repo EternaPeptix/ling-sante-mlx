@@ -625,10 +625,32 @@ class ArraysCache(_BaseCache):
     def state(self, v):
         self.cache, self.left_padding, self.lengths = v
 
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        out = cls.__new__(cls)
+        memo[id(self)] = out
+        # Shallow-copy immutable array references (avoids deep-copying ~283 MB KDA states)
+        # while copying 1-D metadata arrays so advance() never aliases cached entries.
+        out.cache = list(self.cache)
+        out.left_padding = (
+            mx.array(self.left_padding) if self.left_padding is not None else None
+        )
+        out.lengths = mx.array(self.lengths) if self.lengths is not None else None
+        for attr in ("_lingsante_mtp_state", "_lingsante_lp_ok"):
+            val = getattr(self, attr, None)
+            if val is not None:
+                setattr(out, attr, copy.deepcopy(val, memo))
+        return out
+
     def filter(self, batch_indices):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        bs = self.batch_size
+        if len(batch_indices) == bs and all(
+            int(batch_indices[i]) == i for i in range(bs)
+        ):
+            return
         self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
         if self.left_padding is not None:
             self.left_padding = self.left_padding[batch_indices]
@@ -668,7 +690,10 @@ class ArraysCache(_BaseCache):
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
-        cache.cache = [c[idx : idx + 1] for c in self.cache]
+        if self.batch_size == 1 and idx == 0:
+            cache.cache = list(self.cache)
+        else:
+            cache.cache = [c[idx : idx + 1] if c is not None else None for c in self.cache]
         return cache
 
     def prepare(self, lengths=None, **kwargs):
@@ -680,9 +705,9 @@ class ArraysCache(_BaseCache):
 
     def advance(self, N):
         if self.lengths is not None:
-            self.lengths -= N
+            self.lengths = self.lengths - N
         if self.left_padding is not None:
-            self.left_padding -= N
+            self.left_padding = self.left_padding - N
 
     def make_mask(self, N: int):
         pos = mx.arange(N)
@@ -703,6 +728,15 @@ class ArraysCache(_BaseCache):
         # All caches are empty so return early
         if all(c.empty() for c in caches):
             cache.left_padding = mx.array([0] * B)
+            return cache
+
+        if B == 1:
+            c0 = caches[0]
+            cache.cache = list(c0.cache)
+            if c0.left_padding is not None:
+                cache.left_padding = mx.array(c0.left_padding)
+            if c0.lengths is not None:
+                cache.lengths = mx.array(c0.lengths)
             return cache
 
         for e in range(n_state):
