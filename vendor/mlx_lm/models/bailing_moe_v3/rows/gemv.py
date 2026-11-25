@@ -109,15 +109,15 @@ template <
     int PSS_IN,
     int EMIT_PSS>
 METAL_FUNC void bailing_gemv_rows_run(
-    const device WT* mat,
-    const device WT* mat_up,
-    const device XT* in_vec,   // (B, KK) row-major
-    const device T* res_vec,   // (B, N) row-major when RES == 1
-    const device float* pss_in,
-    const device bfloat16_t* norm_w,
+    const device WT* __restrict mat,
+    const device WT* __restrict mat_up,
+    const device XT* __restrict in_vec,   // (B, KK) row-major
+    const device T* __restrict res_vec,   // (B, N) row-major when RES == 1
+    const device float* __restrict pss_in,
+    const device bfloat16_t* __restrict norm_w,
     const float norm_eps,
-    device T* out_vec,         // (B, N) row-major
-    device float* pss_out,
+    device T* __restrict out_vec,         // (B, N) row-major
+    device float* __restrict pss_out,
     const int N,
     threadgroup float* tgp_memory,
     threadgroup bfloat16_t* tg_y,

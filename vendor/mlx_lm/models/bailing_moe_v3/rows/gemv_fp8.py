@@ -84,6 +84,10 @@ METAL_FUNC bfloat4 bv3_fp8x4_to_bf4_sc256(uchar4 pk, float sc256) {
   return bfloat4(f4);
 }
 
+METAL_FUNC float4 bv3_fp8x4_to_f4_sc256(uchar4 pk, float sc256) {
+  return float4(bv3_fp8x4_to_bf4_sc256(pk, sc256));
+}
+
 // Bit-exact BN=8 tail helper for small BF16 projections (KDA b_proj / MLA g_proj, N=64, K=4096)
 // fused into the same launch as FP8 projections (qkvfg / q_a+kv_a).
 // Uses TM=1 per TG (64 TGs total) and exact BN=8 ascending reduction (0+1+...+7) -> 0 bit diffs.
@@ -272,19 +276,21 @@ template <
     int KK,
     int KMAJOR,
     int PSS_IN,
-    int EMIT_PSS>
+    int EMIT_PSS,
+    int UNROLL,
+    int WF_MODE>
 METAL_FUNC void bailing_gemv_fp8_rows_run(
-    const device uchar* mat,
-    const device float* sc_mat,
-    const device uchar* mat_up,
-    const device float* sc_up,
-    const device XT* in_vec,   // (B, KK) row-major
-    const device T* res_vec,   // (B, N) row-major when RES == 1
-    const device float* pss_in,
-    const device bfloat16_t* norm_w,
+    const device uchar* __restrict mat,
+    const device float* __restrict sc_mat,
+    const device uchar* __restrict mat_up,
+    const device float* __restrict sc_up,
+    const device XT* __restrict in_vec,   // (B, KK) row-major
+    const device T* __restrict res_vec,   // (B, N) row-major when RES == 1
+    const device float* __restrict pss_in,
+    const device bfloat16_t* __restrict norm_w,
     const float norm_eps,
-    device T* out_vec,         // (B, N) row-major
-    device float* pss_out,
+    device T* __restrict out_vec,         // (B, N) row-major
+    device float* __restrict pss_out,
     const int N,
     threadgroup float* tg_acc,
     threadgroup bfloat16_t* tg_y,
@@ -361,72 +367,146 @@ METAL_FUNC void bailing_gemv_fp8_rows_run(
   const int lane4 = int(simd_lid) * 4;
 
   if (row_valid) {
-    for (int i = 0; i < k_blocks_u; ++i) {
-      const float sc256 = simd_broadcast_first(sc_mat[i] * 256.0f);
-      const float sc256_u = SWIGLU ? simd_broadcast_first(sc_up[i] * 256.0f) : 0.0f;
-      bfloat4 nw_v;
-      if constexpr (PSS_IN > 0 && sizeof(XT) == 2) {
-        nw_v = *(const device bfloat4*)(norm_w + bn);
-      }
-
-      bfloat4 wf[TM];
-      bfloat4 wf_u[SWIGLU ? TM : 1];
+    if constexpr (UNROLL > 1 && KMAJOR == 0 && PSS_IN == 0 && B_TG == 0 && sizeof(XT) == 2) {
+      // Unrolled cold-DRAM fast path: prefetch UNROLL K-blocks of uchar4 weights before dequant/FMA,
+      // and hoist float4 weights (WF_MODE 1: bi-outer float4 wf[TM]; WF_MODE 2: tm-outer single float4 wv;
+      // WF_MODE 0: bi-outer bfloat4 wf[TM]). 100% bit-exact K-block reduction order!
+      for (int i = 0; i < k_blocks_u; i += UNROLL) {
+        uchar4 pk_u[UNROLL][TM];
+        uchar4 pku_u[SWIGLU ? UNROLL : 1][SWIGLU ? TM : 1];
+        float sc_u[UNROLL];
+        float scu_u[SWIGLU ? UNROLL : 1];
 #pragma unroll
-      for (int tm = 0; tm < TM; tm++) {
-        const size_t mo = KMAJOR
-            ? (size_t(i) * 512 + size_t(tm) * 128 + lane4)
-            : (size_t(tm) * KK + bn);
-        const uchar4 pk = *(const device uchar4*)(mat + mo);
-        wf[tm] = bv3_fp8x4_to_bf4_sc256(pk, sc256);
-        if constexpr (SWIGLU) {
-          const uchar4 pku = *(const device uchar4*)(mat_up + mo);
-          wf_u[tm] = bv3_fp8x4_to_bf4_sc256(pku, sc256_u);
+        for (int u = 0; u < UNROLL; ++u) {
+          sc_u[u] = simd_broadcast_first(sc_mat[i + u] * 256.0f);
+          if constexpr (SWIGLU) scu_u[u] = simd_broadcast_first(sc_up[i + u] * 256.0f);
+#pragma unroll
+          for (int tm = 0; tm < TM; ++tm) {
+            const size_t mo = size_t(tm) * KK + bn + u * blockN;
+            pk_u[u][tm] = *(const device uchar4*)(mat + mo);
+            if constexpr (SWIGLU) pku_u[u][tm] = *(const device uchar4*)(mat_up + mo);
+          }
         }
-      }
-
 #pragma unroll
-      for (int bi = 0; bi < B_REG; bi++) {
-        const int b = b0 + bi;
-        if (b < B) {
-          float4 vc;
-          if constexpr (sizeof(XT) == 2) {
-            bfloat4 px = *(const device bfloat4*)(in_vec + size_t(b) * KK + bn);
-            if constexpr (PSS_IN > 0) {
-              px = bv3_apply_rms_bf4(px, nw_v, inv_b[bi]);
+        for (int u = 0; u < UNROLL; ++u) {
+          const int bnu = bn + u * blockN;
+          if constexpr (WF_MODE == 2 && !SWIGLU) {
+            // tm-outer, single float4 wv live (4 regs, zero redundant bf16->f32 shifts, zero B=9..12 spill!)
+#pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+              float4 wv = bv3_fp8x4_to_f4_sc256(pk_u[u][tm], sc_u[u]);
+#pragma unroll
+              for (int bi = 0; bi < B_REG; ++bi) {
+                const int b = b0 + bi;
+                if (b < B) {
+                  float4 vc = float4(*(const device bfloat4*)(in_vec + size_t(b) * KK + bnu));
+                  float acc = result[bi][tm];
+                  acc += wv.x * vc.x;
+                  acc += wv.y * vc.y;
+                  acc += wv.z * vc.z;
+                  acc += wv.w * vc.w;
+                  result[bi][tm] = acc;
+                }
+              }
             }
-            vc = float4(px);
+          } else if constexpr (WF_MODE == 1) {
+            // Hoisted float4 wf[TM] (zero redundant bf16->f32 shifts inside bi loop for B<=8!)
+            float4 wf[TM];
+            float4 wf_u[SWIGLU ? TM : 1];
+#pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+              wf[tm] = bv3_fp8x4_to_f4_sc256(pk_u[u][tm], sc_u[u]);
+              if constexpr (SWIGLU) wf_u[tm] = bv3_fp8x4_to_f4_sc256(pku_u[u][tm], scu_u[u]);
+            }
+#pragma unroll
+            for (int bi = 0; bi < B_REG; ++bi) {
+              const int b = b0 + bi;
+              if (b < B) {
+                float4 vc = float4(*(const device bfloat4*)(in_vec + size_t(b) * KK + bnu));
+#pragma unroll
+                for (int tm = 0; tm < TM; ++tm) {
+                  float acc = result[bi][tm];
+                  acc += wf[tm].x * vc.x;
+                  acc += wf[tm].y * vc.y;
+                  acc += wf[tm].z * vc.z;
+                  acc += wf[tm].w * vc.w;
+                  result[bi][tm] = acc;
+                  if constexpr (SWIGLU) {
+                    float accu = result_up[bi][tm];
+                    accu += wf_u[tm].x * vc.x;
+                    accu += wf_u[tm].y * vc.y;
+                    accu += wf_u[tm].z * vc.z;
+                    accu += wf_u[tm].w * vc.w;
+                    result_up[bi][tm] = accu;
+                  }
+                }
+              }
+            }
           } else {
-            vc = float4(
-                static_cast<float>(in_vec[size_t(b) * KK + bn + 0]),
-                static_cast<float>(in_vec[size_t(b) * KK + bn + 1]),
-                static_cast<float>(in_vec[size_t(b) * KK + bn + 2]),
-                static_cast<float>(in_vec[size_t(b) * KK + bn + 3]));
-          }
+            // Low-register bfloat4 wf[TM]
+            bfloat4 wf[TM];
+            bfloat4 wf_u[SWIGLU ? TM : 1];
 #pragma unroll
-          for (int tm = 0; tm < TM; tm++) {
-            float4 wv = float4(wf[tm]);
-            float acc = result[bi][tm];
-            acc += wv.x * vc.x;
-            acc += wv.y * vc.y;
-            acc += wv.z * vc.z;
-            acc += wv.w * vc.w;
-            result[bi][tm] = acc;
-            if constexpr (SWIGLU) {
-              float4 wvu = float4(wf_u[tm]);
-              float accu = result_up[bi][tm];
-              accu += wvu.x * vc.x;
-              accu += wvu.y * vc.y;
-              accu += wvu.z * vc.z;
-              accu += wvu.w * vc.w;
-              result_up[bi][tm] = accu;
+            for (int tm = 0; tm < TM; ++tm) {
+              wf[tm] = bv3_fp8x4_to_bf4_sc256(pk_u[u][tm], sc_u[u]);
+              if constexpr (SWIGLU) wf_u[tm] = bv3_fp8x4_to_bf4_sc256(pku_u[u][tm], scu_u[u]);
+            }
+#pragma unroll
+            for (int bi = 0; bi < B_REG; ++bi) {
+              const int b = b0 + bi;
+              if (b < B) {
+                float4 vc = float4(*(const device bfloat4*)(in_vec + size_t(b) * KK + bnu));
+#pragma unroll
+                for (int tm = 0; tm < TM; ++tm) {
+                  float4 wv = float4(wf[tm]);
+                  float acc = result[bi][tm];
+                  acc += wv.x * vc.x;
+                  acc += wv.y * vc.y;
+                  acc += wv.z * vc.z;
+                  acc += wv.w * vc.w;
+                  result[bi][tm] = acc;
+                  if constexpr (SWIGLU) {
+                    float4 wvu = float4(wf_u[tm]);
+                    float accu = result_up[bi][tm];
+                    accu += wvu.x * vc.x;
+                    accu += wvu.y * vc.y;
+                    accu += wvu.z * vc.z;
+                    accu += wvu.w * vc.w;
+                    result_up[bi][tm] = accu;
+                  }
+                }
+              }
             }
           }
         }
+        bn += blockN * UNROLL;
       }
-      if constexpr (B_TG > 0) {
+    } else {
+      for (int i = 0; i < k_blocks_u; ++i) {
+        const float sc256 = simd_broadcast_first(sc_mat[i] * 256.0f);
+        const float sc256_u = SWIGLU ? simd_broadcast_first(sc_up[i] * 256.0f) : 0.0f;
+        bfloat4 nw_v;
+        if constexpr (PSS_IN > 0 && sizeof(XT) == 2) {
+          nw_v = *(const device bfloat4*)(norm_w + bn);
+        }
+
+        bfloat4 wf[TM];
+        bfloat4 wf_u[SWIGLU ? TM : 1];
 #pragma unroll
-        for (int ti = 0; ti < B_TG; ti++) {
-          const int bi = B_REG + ti;
+        for (int tm = 0; tm < TM; tm++) {
+          const size_t mo = KMAJOR
+              ? (size_t(i) * 512 + size_t(tm) * 128 + lane4)
+              : (size_t(tm) * KK + bn);
+          const uchar4 pk = *(const device uchar4*)(mat + mo);
+          wf[tm] = bv3_fp8x4_to_bf4_sc256(pk, sc256);
+          if constexpr (SWIGLU) {
+            const uchar4 pku = *(const device uchar4*)(mat_up + mo);
+            wf_u[tm] = bv3_fp8x4_to_bf4_sc256(pku, sc256_u);
+          }
+        }
+
+#pragma unroll
+        for (int bi = 0; bi < B_REG; bi++) {
           const int b = b0 + bi;
           if (b < B) {
             float4 vc;
@@ -446,28 +526,70 @@ METAL_FUNC void bailing_gemv_fp8_rows_run(
 #pragma unroll
             for (int tm = 0; tm < TM; tm++) {
               float4 wv = float4(wf[tm]);
-              const int slot = (ti * TOT_R + tm) * 32;
-              float acc = my_tg[slot];
+              float acc = result[bi][tm];
               acc += wv.x * vc.x;
               acc += wv.y * vc.y;
               acc += wv.z * vc.z;
               acc += wv.w * vc.w;
-              my_tg[slot] = acc;
+              result[bi][tm] = acc;
               if constexpr (SWIGLU) {
                 float4 wvu = float4(wf_u[tm]);
-                const int slot_u = (ti * TOT_R + TM + tm) * 32;
-                float accu = my_tg[slot_u];
+                float accu = result_up[bi][tm];
                 accu += wvu.x * vc.x;
                 accu += wvu.y * vc.y;
                 accu += wvu.z * vc.z;
                 accu += wvu.w * vc.w;
-                my_tg[slot_u] = accu;
+                result_up[bi][tm] = accu;
               }
             }
           }
         }
+        if constexpr (B_TG > 0) {
+#pragma unroll
+          for (int ti = 0; ti < B_TG; ti++) {
+            const int bi = B_REG + ti;
+            const int b = b0 + bi;
+            if (b < B) {
+              float4 vc;
+              if constexpr (sizeof(XT) == 2) {
+                bfloat4 px = *(const device bfloat4*)(in_vec + size_t(b) * KK + bn);
+                if constexpr (PSS_IN > 0) {
+                  px = bv3_apply_rms_bf4(px, nw_v, inv_b[bi]);
+                }
+                vc = float4(px);
+              } else {
+                vc = float4(
+                    static_cast<float>(in_vec[size_t(b) * KK + bn + 0]),
+                    static_cast<float>(in_vec[size_t(b) * KK + bn + 1]),
+                    static_cast<float>(in_vec[size_t(b) * KK + bn + 2]),
+                    static_cast<float>(in_vec[size_t(b) * KK + bn + 3]));
+              }
+#pragma unroll
+              for (int tm = 0; tm < TM; tm++) {
+                float4 wv = float4(wf[tm]);
+                const int slot = (ti * TOT_R + tm) * 32;
+                float acc = my_tg[slot];
+                acc += wv.x * vc.x;
+                acc += wv.y * vc.y;
+                acc += wv.z * vc.z;
+                acc += wv.w * vc.w;
+                my_tg[slot] = acc;
+                if constexpr (SWIGLU) {
+                  float4 wvu = float4(wf_u[tm]);
+                  const int slot_u = (ti * TOT_R + TM + tm) * 32;
+                  float accu = my_tg[slot_u];
+                  accu += wvu.x * vc.x;
+                  accu += wvu.y * vc.y;
+                  accu += wvu.z * vc.z;
+                  accu += wvu.w * vc.w;
+                  my_tg[slot_u] = accu;
+                }
+              }
+            }
+          }
+        }
+        bn += blockN;
       }
-      bn += blockN;
     }
   }
 
@@ -709,8 +831,8 @@ def pack_qkvfg_fp8(mods, *, k_major: bool = False):
     return w_cat, s_cat
 
 
-def _fp8_cfg(N: int, K: int, B: int, is_swiglu: bool = False):
-    """Empirically tuned `(bsg, b_sub, bm_m, tm)` per B regime on M3 Ultra (`bsg=1` across B=1..16!)."""
+def _fp8_cfg(N: int, K: int, B: int, is_swiglu: bool = False, emit_pss: bool = False):
+    """Cold multi-layer DRAM tuned `(bsg, b_sub, bm_m, tm)` per B regime on M3 Ultra (`bsg=1` across B=1..16!)."""
     if _ENV_FP8_CFG is not None:
         bsg, bm_m, tm = _ENV_FP8_CFG
         b_sub = (B + bsg - 1) // bsg
@@ -719,29 +841,57 @@ def _fp8_cfg(N: int, K: int, B: int, is_swiglu: bool = False):
         return bsg, b_sub, bm_m, tm
 
     if is_swiglu:
-        if B <= 2:
-            bsg, bm_m, tm = 1, 4, 4
-        elif B <= 6:
-            bsg, bm_m, tm = 1, 4, 2
-        elif B <= 16:
-            bsg, bm_m, tm = 1, 4, 1
+        if N <= 2048:
+            # shared_experts SwiGLU (N=1280, K=4096): higher TG count avoids 80-core underfill!
+            if B <= 4:
+                bsg, bm_m, tm = 1, 4, 2
+            elif B <= 6:
+                bsg, bm_m, tm = 1, 4, 1
+            elif B <= 8:
+                bsg, bm_m, tm = 1, 2, 1  # 640 TGs: 36.0us vs 47.4us (-0.78ms x68)
+            elif B <= 16:
+                bsg, bm_m, tm = 1, 4, 1
+            else:
+                bsg, bm_m, tm = 2, 4, 1
         else:
-            bsg, bm_m, tm = 2, 4, 1
+            # dense SwiGLU (N=10240, K=4096)
+            if B <= 6:
+                bsg, bm_m, tm = 1, 4, 1
+            elif B <= 8:
+                bsg, bm_m, tm = 1, 4, 2  # 138.6us vs 152.7us
+            elif B <= 16:
+                bsg, bm_m, tm = 1, 4, 1
+            else:
+                bsg, bm_m, tm = 2, 4, 1
     else:
         if N == 4096:
-            # T5: avoid 128-TG (1.6 waves) & 256-TG (3.2 waves) 80-core tail underfill!
-            # B<=12 use bm_m=4, tm=2 (512 TGs, b_reg=12, zero tg_acc spill); B=13..16 use bm_m=8, tm=2.
-            if B <= 12:
-                bsg, bm_m, tm = 1, 4, 2
-            elif B <= 16:
-                bsg, bm_m, tm = 1, 8, 2
+            if K >= 8192:
+                # KDA/MLA o_proj (K=8192) & dense down_proj (K=10240)
+                if B <= 5:
+                    bsg, bm_m, tm = (1, 2, 2) if emit_pss else (1, 2, 1)  # 65-66us cold (vs 70-77us)
+                elif B <= 8:
+                    bsg, bm_m, tm = (1, 2, 2) if K >= 10240 else (1, 4, 2)  # 69.4us cold (vs 92.3us)
+                elif B <= 12:
+                    bsg, bm_m, tm = 1, 4, 2  # WF_MODE=2 tm-outer: 82.4us cold (vs 102-114us)
+                elif B <= 16:
+                    bsg, bm_m, tm = 1, 8, 2
+                else:
+                    bsg, bm_m, tm = 2, 4, 2
             else:
-                bsg, bm_m, tm = 2, 4, 2
+                # shared_experts down_proj (N=4096, K=1280)
+                if B <= 4:
+                    bsg, bm_m, tm = 1, 2, 2
+                elif B <= 6:
+                    bsg, bm_m, tm = (1, 2, 2) if emit_pss else (1, 2, 1)
+                elif B <= 12:
+                    bsg, bm_m, tm = 1, 4, 2
+                elif B <= 16:
+                    bsg, bm_m, tm = 1, 8, 2
+                else:
+                    bsg, bm_m, tm = 2, 4, 2
         else:
-            if B <= 4:
-                bsg, bm_m, tm = 1, 4, 4  # b_reg=4, zero tg_acc spill across B=1..4
-            elif B <= 12:
-                bsg, bm_m, tm = 1, 4, 2  # b_reg=12, zero tg_acc spill across B=5..12
+            if B <= 12:
+                bsg, bm_m, tm = 1, 4, 2  # U=2 + WF_MODE=1 (B<=8) / WF_MODE=2 (B=9..12)
             elif B <= 16:
                 bsg, bm_m, tm = 1, 8, 2  # 425us at B=16 (vs 483us bsg=2)
             else:
@@ -750,6 +900,38 @@ def _fp8_cfg(N: int, K: int, B: int, is_swiglu: bool = False):
         tm = 1
     b_sub = (B + bsg - 1) // bsg
     return bsg, b_sub, bm_m, tm
+
+
+def _fp8_unroll_wf(N: int, K: int, B: int, cfg, b_reg: int, is_swiglu: bool, k_major: bool, pss_in: int, x_dt):
+    """Select `(unroll, wf_mode)` for the cold-DRAM unrolled fast path (0 bit diffs)."""
+    if k_major or pss_in > 0 or x_dt != mx.bfloat16:
+        return 1, 0
+    bsg, b_sub, _, tm = cfg
+    if bsg > 1 or b_sub != b_reg:
+        return 1, 0
+    k_blocks = K >> 7
+    if is_swiglu:
+        if B <= 12:
+            unroll = 2
+            wf_mode = 1 if (B <= 4 or (tm == 1 and B <= 8)) else 0
+        else:
+            return 1, 0
+    else:
+        if N == 4096 and K <= 2048 and B >= 7:
+            return 1, 0
+        if B <= 8:
+            unroll = 4 if (tm == 1 and k_blocks % 4 == 0) else 2
+            wf_mode = 1
+        elif B <= 12:
+            unroll = 2
+            wf_mode = 2
+        else:
+            return 1, 0
+    while unroll > 1 and (k_blocks % unroll != 0):
+        unroll //= 2
+    if unroll == 1:
+        wf_mode = 0
+    return unroll, wf_mode
 
 
 def _b_reg_fp8(b_sub: int, tm: int, is_swiglu: bool) -> int:
@@ -788,10 +970,15 @@ def _build_fp8_group(
     norm_eps=1e-6,
     bf16_tail_n=0,
     router_tail_n=0,
+    shared_x=False,
 ):
     km_i = int(bool(k_major))
     emit_i = int(bool(emit_pss))
+    sx_i = int(bool(shared_x and G > 1))
     eps_f = float(norm_eps) if pss_in > 0 else 0.0
+    bsg, b_sub, bm_m, tm = cfg
+    b_reg = _b_reg_fp8(b_sub, tm, is_swiglu)
+    unroll, wf_mode = _fp8_unroll_wf(max(Ns), K, B, cfg, b_reg, is_swiglu, k_major, pss_in, x_dt)
     key = (
         "fp8",
         out_dt,
@@ -809,11 +996,12 @@ def _build_fp8_group(
         eps_f,
         bf16_tail_n,
         router_tail_n,
+        sx_i,
+        unroll,
+        wf_mode,
     )
     if key in _KERNELS:
         return _KERNELS[key]
-    bsg, b_sub, bm_m, tm = cfg
-    b_reg = _b_reg_fp8(b_sub, tm, is_swiglu)
     b_tg = b_sub - b_reg
     nsg = bsg * bm_m
     blockM = bm_m * tm
@@ -839,7 +1027,7 @@ def _build_fp8_group(
         sup = "su0" if is_swiglu else "s0"
         rv = "res" if has_res else "out0"
         lines.append(
-            f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {b_reg}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {K}, {km_i}, {pss_in}, {emit_i}>"
+            f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {b_reg}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {K}, {km_i}, {pss_in}, {emit_i}, {unroll}, {wf_mode}>"
             f"(w0, s0, {wup}, {sup}, x0, {rv}, {pss_in_arg}, {nw_arg}, {eps_lit}, out0, {pss_out_arg}, {N0}, tg_acc, tg_y, t, "
             f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
         )
@@ -847,42 +1035,47 @@ def _build_fp8_group(
     else:
         for g, N in enumerate(Ns):
             start += (N + blockM - 1) // blockM
-        fp8_tgs = start
+        tail_front = 0
         if bf16_tail_n > 0:
-            lines.append(f"if (t >= {fp8_tgs}) {{")
+            # Schedule small BF16 tail at FRONT of grid (t < bf16_tail_n) to eliminate straggler tail wave!
+            tail_front = bf16_tail_n
+            lines.append(f"if (t < {tail_front}) {{")
             lines.append(
                 f"  bailing_gemv_bf16_bn8_tail_run<{T}, {XT}, {B}, {nsg}, {K}, {pss_in}>"
-                f"(w_bf, x0, {pss_in_arg}, {nw_arg}, {eps_lit}, out_bf, {bf16_tail_n}, tg_acc, t - {fp8_tgs}, "
+                f"(w_bf, x0, {pss_in_arg}, {nw_arg}, {eps_lit}, out_bf, {bf16_tail_n}, tg_acc, t, "
                 f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
             )
             lines.append("  return;")
             lines.append("}")
-            start += bf16_tail_n  # TM=1 per TG for BN=8 tail
+            start += tail_front
         elif router_tail_n > 0:
             nt_r = (router_tail_n + nsg - 1) // nsg
-            lines.append(f"if (t >= {fp8_tgs}) {{")
+            tail_front = nt_r
+            lines.append(f"if (t < {tail_front}) {{")
             lines.append(
                 f"  bailing_router_bf16_tail_run<{XT}, {B}, {nsg}, {K}, {pss_in}>"
-                f"(w_rtr, x0, {pss_in_arg}, {nw_arg}, {eps_lit}, out_rtr, {router_tail_n}, t - {fp8_tgs}, "
+                f"(w_rtr, x0, {pss_in_arg}, {nw_arg}, {eps_lit}, out_rtr, {router_tail_n}, t, "
                 f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
             )
             lines.append("  return;")
             lines.append("}")
-            start += nt_r
+            start += tail_front
 
+        t_expr = f"(t - {tail_front})" if tail_front > 0 else "t"
         if G == 1:
             N0 = Ns[0]
             wup = "u0" if is_swiglu else "w0"
             sup = "su0" if is_swiglu else "s0"
             rv = "res" if has_res else "out0"
             lines.append(
-                f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {b_reg}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {K}, {km_i}, {pss_in}, {emit_i}>"
-                f"(w0, s0, {wup}, {sup}, x0, {rv}, {pss_in_arg}, {nw_arg}, {eps_lit}, out0, {pss_out_arg}, {N0}, tg_acc, tg_y, t, "
+                f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {b_reg}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {K}, {km_i}, {pss_in}, {emit_i}, {unroll}, {wf_mode}>"
+                f"(w0, s0, {wup}, {sup}, x0, {rv}, {pss_in_arg}, {nw_arg}, {eps_lit}, out0, {pss_out_arg}, {N0}, tg_acc, tg_y, {t_expr}, "
                 f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
             )
         else:
             assert not emit_i, "emit_pss only supported for G == 1"
             lines.extend([
+                f"const uint tf = {t_expr};",
                 "const device uchar* wp = w0;",
                 "const device float* sp = s0;",
                 "const device uchar* up_p = w0;",
@@ -891,33 +1084,35 @@ def _build_fp8_group(
                 f"device {T}* op = out0;",
                 f"const device {T}* rp = out0;",
                 f"int n_cur = {Ns[0]};",
-                "uint t_loc = t;",
+                "uint t_loc = tf;",
             ])
             cur = 0
             for g, N in enumerate(Ns):
                 nt = (N + blockM - 1) // blockM
                 kw = "if" if g == 0 else "else if"
                 wup_s = f"up_p = u{g}; sup_p = su{g}; " if is_swiglu else ""
+                xp_s = "" if sx_i else f"xp = x{g}; "
                 rv_s = "rp = res; " if has_res else f"rp = out{g}; "
                 if g < len(Ns) - 1:
                     lines.append(
-                        f"{kw} (t < {cur + nt}) {{ wp = w{g}; sp = s{g}; {wup_s}xp = x{g}; {rv_s}op = out{g}; n_cur = {N}; t_loc = t - {cur}; }}"
+                        f"{kw} (tf < {cur + nt}) {{ wp = w{g}; sp = s{g}; {wup_s}{xp_s}{rv_s}op = out{g}; n_cur = {N}; t_loc = tf - {cur}; }}"
                     )
                 else:
                     lines.append(
-                        f"else {{ wp = w{g}; sp = s{g}; {wup_s}xp = x{g}; {rv_s}op = out{g}; n_cur = {N}; t_loc = t - {cur}; }}"
+                        f"else {{ wp = w{g}; sp = s{g}; {wup_s}{xp_s}{rv_s}op = out{g}; n_cur = {N}; t_loc = tf - {cur}; }}"
                     )
                 cur += nt
+            xp_arg = "x0" if sx_i else "xp"
             lines.append(
-                f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {b_reg}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {K}, {km_i}, {pss_in}, 0>"
-                f"(wp, sp, up_p, sup_p, xp, rp, {pss_in_arg}, {nw_arg}, {eps_lit}, op, {pss_out_arg}, n_cur, tg_acc, tg_y, t_loc, "
+                f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {b_reg}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {K}, {km_i}, {pss_in}, 0, {unroll}, {wf_mode}>"
+                f"(wp, sp, up_p, sup_p, {xp_arg}, rp, {pss_in_arg}, {nw_arg}, {eps_lit}, op, {pss_out_arg}, n_cur, tg_acc, tg_y, t_loc, "
                 f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
             )
 
     in_names = [f"w{g}" for g in range(G)] + [f"s{g}" for g in range(G)]
     if is_swiglu:
         in_names += [f"u{g}" for g in range(G)] + [f"su{g}" for g in range(G)]
-    in_names += [f"x{g}" for g in range(G)]
+    in_names += ["x0"] if sx_i else [f"x{g}" for g in range(G)]
     if has_res:
         in_names.append("res")
     if bf16_tail_n > 0:
@@ -935,7 +1130,7 @@ def _build_fp8_group(
         out_names.append("pss_out")
     tag = (
         f"{out_dt}_{x_dt}_b{B}_g{G}_k{K}_r{int(has_res)}_s{int(is_swiglu)}_km{km_i}"
-        f"_pi{pss_in}_po{emit_i}_bt{bf16_tail_n}_rt{router_tail_n}_br{b_reg}_{'_'.join(map(str, Ns + list(cfg)))}"
+        f"_pi{pss_in}_po{emit_i}_bt{bf16_tail_n}_rt{router_tail_n}_sx{sx_i}_u{unroll}_wm{wf_mode}_br{b_reg}_{'_'.join(map(str, Ns + list(cfg)))}"
     )
     tag = tag.replace("mlx.core.", "")
     kern = mx.fast.metal_kernel(
@@ -1002,11 +1197,13 @@ def gemv_fp8_rows_group(
     bsg, _, bm_m, tm = cfg
     assert all(n % tm == 0 for n in Ns), f"Ns={Ns} not divisible by tm={tm}"
     G = len(ws_fp8)
+    shared_x = G > 1 and all(x is xs[0] for x in xs)
     kern, ntg = _build_fp8_group(
-        dt, dt, B, G, Ns, K, cfg, k_major=k_major, pss_in=pss_in, norm_eps=norm_eps
+        dt, dt, B, G, Ns, K, cfg, k_major=k_major, pss_in=pss_in, norm_eps=norm_eps, shared_x=shared_x
     )
     nsg = bsg * bm_m
-    inputs = ws_fp8 + scs + xs + ([part_ss, norm_w] if pss_in > 0 else [])
+    x_in = [xs[0]] if shared_x else xs
+    inputs = ws_fp8 + scs + x_in + ([part_ss, norm_w] if pss_in > 0 else [])
     return list(
         kern(
             inputs=inputs,
@@ -1049,7 +1246,7 @@ def gemv_fp8_rows(
     assert 1 <= B <= MAX_B and K % 128 == 0 and N % 128 == 0
     pss_in = _validate_pss_in(part_ss, norm_w, B, K)
     if cfg is None:
-        cfg = _fp8_cfg(N, K, B, False)
+        cfg = _fp8_cfg(N, K, B, False, emit_pss=True)
     bsg, _, bm_m, tm = cfg
     blockM = bm_m * tm
     assert N % blockM == 0 and blockM % 4 == 0
@@ -1090,12 +1287,12 @@ def gemv_fp8_rows_res(
     assert 1 <= B <= MAX_B and K % 128 == 0 and res.shape == (B, N) and res.dtype == dt
     assert w_fp8.dtype == mx.uint8 and sc.dtype == mx.float32
     pss_in = _validate_pss_in(part_ss, norm_w, B, K)
+    emit_i = bool(return_part_ss)
     if cfg is None:
-        cfg = _fp8_cfg(N, K, B, False)
+        cfg = _fp8_cfg(N, K, B, False, emit_pss=emit_i)
     bsg, _, bm_m, tm = cfg
     blockM = bm_m * tm
     assert N % tm == 0
-    emit_i = bool(return_part_ss)
     if emit_i:
         assert N % 128 == 0 and N % blockM == 0 and blockM % 4 == 0
     kern, ntg = _build_fp8_group(
@@ -1195,6 +1392,7 @@ def gemv_fp8_with_bf16_tail_rows(
     bsg, _, bm_m, tm = cfg
     assert all(n % tm == 0 for n in Ns)
     G = len(ws_fp8)
+    shared_x = G > 1
     kern, ntg = _build_fp8_group(
         dt,
         dt,
@@ -1207,9 +1405,10 @@ def gemv_fp8_with_bf16_tail_rows(
         pss_in=pss_in,
         norm_eps=norm_eps,
         bf16_tail_n=N_bf,
+        shared_x=shared_x,
     )
     nsg = bsg * bm_m
-    inputs = ws_fp8 + scs + [x] * G + [w_bf16] + ([part_ss, norm_w] if pss_in > 0 else [])
+    inputs = ws_fp8 + scs + [x] + [w_bf16] + ([part_ss, norm_w] if pss_in > 0 else [])
     return list(
         kern(
             inputs=inputs,
@@ -1307,6 +1506,7 @@ def gemv_kda_qkvfgb_merged_rows(
     bsg, b_sub, bm_m, tm = cfg
     b_reg = _b_reg_fp8(b_sub, tm, False)
     b_tg = b_sub - b_reg
+    unroll, wf_mode = _fp8_unroll_wf(N_tot, K, B, cfg, b_reg, False, False, pss_in, mx.bfloat16)
     nsg = bsg * bm_m
     blockM = bm_m * tm
     assert N_each % blockM == 0
@@ -1314,7 +1514,7 @@ def gemv_kda_qkvfgb_merged_rows(
     fp8_tgs = 5 * nt_each
     ntg = fp8_tgs + N_bf
     eps_f = float(norm_eps) if pss_in > 0 else 0.0
-    key = ("kda_merged", B, N_each, N_bf, K, cfg, b_reg, pss_in, eps_f)
+    key = ("kda_merged", B, N_each, N_bf, K, cfg, b_reg, pss_in, eps_f, unroll, wf_mode)
     kern = _KERNELS.get(key)
     if kern is None:
         tg_acc_elems = max(1, (nsg * b_tg * tm * 32) if b_tg > 0 else 1, B * 8)
@@ -1325,14 +1525,15 @@ def gemv_kda_qkvfgb_merged_rows(
             f"threadgroup float tg_acc[{tg_acc_elems}];",
             "threadgroup bfloat16_t tg_y[1];",
             "const uint t = threadgroup_position_in_grid.x;",
-            f"if (t >= {fp8_tgs}) {{",
+            f"if (t < {N_bf}) {{",
             f"  bailing_gemv_bf16_bn8_tail_run<bfloat16_t, bfloat16_t, {B}, {nsg}, {K}, {pss_in}>"
-            f"(w_bf, x0, {pss_in_arg}, {nw_arg}, {eps_lit}, out_bf, {N_bf}, tg_acc, t - {fp8_tgs}, "
+            f"(w_bf, x0, {pss_in_arg}, {nw_arg}, {eps_lit}, out_bf, {N_bf}, tg_acc, t, "
             f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);",
             "  return;",
             "}",
-            f"const uint seg = t / {nt_each};",
-            f"const uint t_loc = t - seg * {nt_each};",
+            f"const uint tf = t - {N_bf};",
+            f"const uint seg = tf / {nt_each};",
+            f"const uint t_loc = tf - seg * {nt_each};",
             f"const device uchar* wp = w_cat + size_t(seg) * {N_each * K};",
             f"const device float* sp = s_cat + size_t(seg) * {(N_each // 128) * (K // 128)};",
             "device bfloat16_t* op = out0;",
@@ -1340,13 +1541,13 @@ def gemv_kda_qkvfgb_merged_rows(
             "else if (seg == 2) op = out2;",
             "else if (seg == 3) op = out3;",
             "else if (seg == 4) op = out4;",
-            f"bailing_gemv_fp8_rows_run<bfloat16_t, bfloat16_t, {B}, {bsg}, {b_sub}, {b_reg}, {bm_m}, {tm}, 0, 0, {K}, 0, {pss_in}, 0>"
+            f"bailing_gemv_fp8_rows_run<bfloat16_t, bfloat16_t, {B}, {bsg}, {b_sub}, {b_reg}, {bm_m}, {tm}, 0, 0, {K}, 0, {pss_in}, 0, {unroll}, {wf_mode}>"
             f"(wp, sp, wp, sp, x0, op, {pss_in_arg}, {nw_arg}, {eps_lit}, op, (device float*)0, {N_each}, tg_acc, tg_y, t_loc, "
             f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);",
         ]
         in_names = ["w_cat", "s_cat", "x0", "w_bf"] + (["pss_in", "norm_w"] if pss_in > 0 else [])
         out_names = ["out0", "out1", "out2", "out3", "out4", "out_bf"]
-        tag = f"b{B}_n{N_each}_pi{pss_in}_br{b_reg}_{'_'.join(map(str, cfg))}"
+        tag = f"b{B}_n{N_each}_pi{pss_in}_u{unroll}_wm{wf_mode}_br{b_reg}_{'_'.join(map(str, cfg))}"
         kern = _KERNELS[key] = mx.fast.metal_kernel(
             name=f"bv3_kda_qkvfgb_m_{tag}",
             input_names=in_names,
