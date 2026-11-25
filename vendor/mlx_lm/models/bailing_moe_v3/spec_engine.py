@@ -1,4 +1,4 @@
-"""Single-sync GPU-chained speculative decoding engine for LingSante (BailingMoeV3 + MTP, C=1..4)."""
+"""Single-sync GPU-chained speculative decoding engine for LingSante (BailingMoeV3 + EAGLE-3 / MTP, C=1..4)."""
 import copy
 import os
 import time
@@ -7,6 +7,8 @@ from typing import Any, Callable, Sequence
 
 import mlx.core as mx
 
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.recurrent import create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache, make_prompt_cache
 
 from .mtp import BailingMTPLayer
@@ -23,7 +25,7 @@ class _MTPBox:
 
 
 def attach_lingsante_mtp(model, model_path: str | Path) -> bool:
-    """Attach native Layer-72 MTP drafter onto a matching LingSante model if available."""
+    """Attach EAGLE-3 Q4-Dense MTP (default if present) or native Layer-72 MTP drafter."""
     if os.environ.get("LINGSANTE_MTP", "1") in ("0", ""):
         return False
     if "bailing_moe_v3" not in type(model).__module__:
@@ -38,6 +40,15 @@ def attach_lingsante_mtp(model, model_path: str | Path) -> bool:
         or getattr(model, "lm_head", None) is None
     ):
         return False
+
+    if os.environ.get("LINGSANTE_EAGLE3", "1") not in ("0", ""):
+        env_dir = os.environ.get("LINGSANTE_EAGLE3_DIR", "").strip()
+        e3_dir = Path(env_dir).expanduser() if env_dir else (Path(model_path) / "eagle3-mtp")
+        if (e3_dir / "model-mtp.safetensors").exists():
+            mtp = BailingMTPLayer.from_eagle3(model, e3_dir, with_q4_head=True, q4_dense=True)
+            model._lingsante_mtp_holder = _MTPBox(mtp)
+            return True
+
     mtp_file = Path(model_path) / "mtp" / "model-mtp.safetensors"
     if not mtp_file.exists():
         return False
@@ -58,10 +69,62 @@ def get_lingsante_mtp(model) -> BailingMTPLayer | None:
     return holder.mtp if holder is not None else None
 
 
-def mtp_k_for_batch(C: int) -> int:
+def mtp_k_for_batch(C: int, mtp: BailingMTPLayer | None = None) -> int:
     if C <= 1:
-        return max(1, int(os.environ.get("LINGSANTE_MTP_K1", "4")))
-    return max(1, int(os.environ.get("LINGSANTE_MTP_KB", "2")))
+        cfg = getattr(mtp, "_eagle3_cfg", None) or {}
+        return max(1, int(os.environ.get("LINGSANTE_MTP_K1", str(cfg.get("fixed_K1", 4)))))
+    cfg = getattr(mtp, "_eagle3_cfg", None) or {}
+    return max(1, int(os.environ.get("LINGSANTE_MTP_KB", str(cfg.get("fixed_KB", 2)))))
+
+
+def mtp_c1_policy(mtp: BailingMTPLayer) -> tuple[str, int, float, float]:
+    """Return `(draft_mode, k_or_cap, dyn_th, p1_min)` for C=1 speculative drafting."""
+    cfg = getattr(mtp, "_eagle3_cfg", None) or {}
+    use_dyn = os.environ.get("LINGSANTE_MTP_DYN", "1") not in ("0", "")
+    if (
+        use_dyn
+        and "LINGSANTE_MTP_K1" not in os.environ
+        and cfg.get("draft_mode") == "dyn_step"
+    ):
+        k_cap = max(1, int(cfg.get("k_cap", 7)))
+        dyn_th = float(os.environ.get("LINGSANTE_DYN_TH", cfg.get("dyn_th", 0.55)))
+        p1_min = float(os.environ.get("LINGSANTE_P1_MIN", cfg.get("p1_min", 0.0)))
+        return "dyn_step", k_cap, dyn_th, p1_min
+    return "fixed", mtp_k_for_batch(1, mtp), 0.0, 0.0
+
+
+def mtp_target_prefill_hidden(
+    model, mtp: BailingMTPLayer, chunk_2d: mx.array, cache, *, return_raw: bool = False
+):
+    """Run target backbone for prefill and return fused MTP input hidden (and optional raw h_final)."""
+    lids = getattr(mtp, "_feat_layers", None)
+    if getattr(mtp, "_feat_fuse", None) is None or not lids:
+        h_raw = model.model(chunk_2d, cache=cache)
+        return (h_raw, h_raw) if return_raw else h_raw
+
+    inner = model.model
+    cap_set = set(lids)
+    h = inner.word_embeddings(chunk_2d)
+    attention_mask = (
+        create_attention_mask(h, cache[inner.attention_index], return_array=True)
+        if inner.attention_index is not None
+        else None
+    )
+    linear_mask = (
+        create_ssm_mask(h, cache[inner.linear_index])
+        if inner.linear_index is not None
+        else None
+    )
+    captured = {}
+    for li, (layer, lc) in enumerate(zip(inner.layers, cache)):
+        mask = linear_mask if layer.is_linear else attention_mask
+        h = layer(h, mask=mask, cache=lc)
+        if li in cap_set:
+            captured[li] = h
+    h_final = inner.norm(h)
+    feats = mx.concatenate([captured[li] for li in lids], axis=-1)
+    h_eff = mtp.apply_feat_fuse(h_final, feats)
+    return (h_final, h_eff) if return_raw else h_eff
 
 
 def is_greedy_sampler(sampler) -> bool:
@@ -131,8 +194,8 @@ def mtp_prefill_chunk(
         pos = 0
         while pos < tot:
             m = min(step, tot - pos)
-            mtp_out = mtp.prefill(m_toks[:, pos : pos + m], m_hs[:, pos : pos + m, :], mc)
-            mx.eval(mtp_out, mc.state)
+            mtp.kv_append(m_toks[:, pos : pos + m], m_hs[:, pos : pos + m, :], mc)
+            mx.eval(mc.state)
             pos += m
 
     new_pending_h = hidden_3d[:, -1:, :]
@@ -200,10 +263,10 @@ def mtp_extract_from_vcache(
 
 
 def mtp_vcache_to_standard(model, vcache: list, C: int) -> list:
-    """Convert split `vcache` back to standard `[ArraysCache(4) | BatchKVCache/KVCache]`."""
+    """Convert split `vcache` back to standard `[ArraysCache(4) | BatchKVCache]`."""
+    if C <= 0:
+        return []
     per = [mtp_extract_from_vcache(model, vcache, i, C, copy_kv=False) for i in range(C)]
-    if C == 1:
-        return per[0]
     n_layers = len(per[0])
     return [type(per[0][li]).merge([per[i][li] for i in range(C)]) for li in range(n_layers)]
 
@@ -258,6 +321,14 @@ def mtp_cancel_inflight(inflight: dict, mtp_caches: list[KVCache]) -> None:
             mc.trim(tr)
 
 
+def _verify_eval_targets(preds: mx.array, hidden: mx.array, draft_mat: mx.array, lp: mx.array, rb: dict) -> list:
+    arrs = [preds, hidden, draft_mat, lp]
+    cap = rb.get("captured")
+    if cap is not None:
+        arrs.append(cap)
+    return arrs
+
+
 def _refresh_mtp_accepted(
     mtp: BailingMTPLayer,
     mtp_caches: list[KVCache],
@@ -269,6 +340,7 @@ def _refresh_mtp_accepted(
     use_q4_head: bool = True,
 ) -> None:
     """Trim MTP caches to `after0_offs` and append only committed draft tokens `[0..nc-2]`."""
+    del use_q4_head
     for mc, aoff in zip(mtp_caches, after0_offs):
         tr = mc.offset - aoff
         if tr > 0:
@@ -279,28 +351,18 @@ def _refresh_mtp_accepted(
     if len(need) == 1:
         ci, Lc = need[0]
         toks = mx.array(draft_lists[ci][:Lc], dtype=mx.uint32)
-        mtp.step_rows(
-            toks,
-            hidden[ci, :Lc, :],
-            mtp_caches[ci],
-            C=1,
-            L=Lc,
-            use_q4_head=use_q4_head,
-            return_logits=False,
-        )
+        mtp.kv_append(toks, hidden[ci, :Lc, :], mtp_caches[ci])
         return
     toks_flat = mx.array(
         [tok for ci, Lc in need for tok in draft_lists[ci][:Lc]],
         dtype=mx.uint32,
     )
     hs_flat = mx.concatenate([hidden[ci, :Lc, :] for ci, Lc in need], axis=0)
-    mtp.step_varlen_rows(
+    mtp.kv_append_varlen(
         toks_flat,
         hs_flat,
         [mtp_caches[ci] for ci, _ in need],
         [Lc for _, Lc in need],
-        use_q4_head=use_q4_head,
-        return_logits=False,
     )
 
 
@@ -333,11 +395,12 @@ def mtp_generate_step(
         if prompt_cache and hasattr(prompt_cache[-1], "_lingsante_mtp_state"):
             delattr(prompt_cache[-1], "_lingsante_mtp_state")
 
+        lids = getattr(mtp, "_feat_layers", None)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
             processed = prompt[:n_to_process]
-            h = model.model(processed[None], cache=prompt_cache)
+            h = mtp_target_prefill_hidden(model, mtp, processed[None], prompt_cache)
             mx.eval(h, [c.state for c in prompt_cache])
             mtp_state = mtp_prefill_chunk(mtp, processed[None], h, mtp_state)
             prompt_processed_tokens += n_to_process
@@ -348,12 +411,20 @@ def mtp_generate_step(
         last_tok = prompt
         if can_fast_verify(model, last_tok[None], prompt_cache):
             logits0, hidden0, rb0 = fast_verify_forward(
-                model, last_tok[None], prompt_cache, return_hidden=True, return_rollback=True
+                model,
+                last_tok[None],
+                prompt_cache,
+                return_hidden=True,
+                return_rollback=True,
+                capture_layers=lids,
             )
             commit_verify_cache(prompt_cache, rb0, 1)
+            hidden0 = mtp.apply_feat_fuse(hidden0, rb0.get("captured"))
         else:
-            hidden0 = model.model(last_tok[None], cache=prompt_cache)
-            logits0 = model.lm_head(hidden0)
+            h_raw, hidden0 = mtp_target_prefill_hidden(
+                model, mtp, last_tok[None], prompt_cache, return_raw=True
+            )
+            logits0 = model.lm_head(h_raw)
 
         y0, lp0_2d = _logits_to_preds(logits0[:, -1, :])
         lp0 = lp0_2d.squeeze(0)
@@ -361,15 +432,7 @@ def mtp_generate_step(
 
         mc, pending_h = mtp_state if mtp_state is not None else (KVCache(), None)
         if pending_h is not None:
-            mtp.step_rows(
-                last_tok,
-                pending_h[:, 0, :],
-                mc,
-                C=1,
-                L=1,
-                use_q4_head=True,
-                return_logits=False,
-            )
+            mtp.kv_append(last_tok, pending_h[:, 0, :], mc)
             mx.eval(mc.state)
 
         prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
@@ -381,20 +444,20 @@ def mtp_generate_step(
                 prompt_cache[-1]._lingsante_mtp_state = (mc, hidden0[:, -1:, :])
             return
 
-        K_base = mtp_k_for_batch(1)
         cur_y = y0
         cur_h = hidden0[:, -1, :]
-        K = K_base if max_tokens < 0 else min(K_base, max_tokens - n)
+        K_lim = None if max_tokens < 0 else max(1, max_tokens - n)
         draft_mat, mtp_exact_offs = _chain_mtp_drafts(
-            mtp, cur_y, cur_h, [mc], C=1, K=K, use_q4_head=True
+            mtp, cur_y, cur_h, [mc], C=1, K_limit=K_lim, use_q4_head=True
         )
+        K = int(draft_mat.shape[1])
         mx.async_eval(draft_mat)
         inp = mx.concatenate([cur_y[:, None], draft_mat], axis=1)
         logits, hidden, rb = fast_verify_forward(
-            model, inp, prompt_cache, return_hidden=True, return_rollback=True
+            model, inp, prompt_cache, return_hidden=True, return_rollback=True, capture_layers=lids
         )
         preds, lp = _logits_to_preds(logits)
-        mx.async_eval(preds, hidden, draft_mat, lp)
+        mx.async_eval(*_verify_eval_targets(preds, hidden, draft_mat, lp, rb))
 
         inflight = {"rb": rb, "mtp_base_offs": [mtp_exact_offs[0] - 1]}
         cur_burst_rb = None
@@ -405,8 +468,9 @@ def mtp_generate_step(
 
         try:
             while True:
-                mx.eval(preds, hidden, draft_mat, lp)
+                mx.eval(*_verify_eval_targets(preds, hidden, draft_mat, lp, rb))
                 inflight = None
+                hidden = mtp.apply_feat_fuse(hidden, rb.get("captured"))
                 pred_row = preds[0].tolist()
                 draft_row = draft_mat[0].tolist()
 
@@ -463,7 +527,7 @@ def mtp_generate_step(
                 commit_verify_cache(prompt_cache, rb, nc)
                 cur_burst_rb = None
                 next_cur = pred_row[a]
-                K_next = K_base if max_tokens < 0 else min(K_base, max_tokens - (n + 1))
+                K_lim_next = None if max_tokens < 0 else max(1, max_tokens - (n + 1))
                 draft_mat_next, mtp_exact_offs = _sync_and_chain_mtp(
                     mtp,
                     hidden,
@@ -473,9 +537,10 @@ def mtp_generate_step(
                     [mc],
                     [mtp_exact_offs[0]],
                     C=1,
-                    K=K_next,
+                    K_limit=K_lim_next,
                     use_q4_head=True,
                 )
+                K_next = int(draft_mat_next.shape[1])
                 flush_arrs = [draft_mat_next]
                 for li, layer in enumerate(model.model.layers):
                     if layer.is_linear:
@@ -485,10 +550,10 @@ def mtp_generate_step(
                 cur_arr = mx.array([next_cur], dtype=mx.uint32)
                 inp_next = mx.concatenate([cur_arr[:, None], draft_mat_next], axis=1)
                 logits_next, hidden_next, rb_next = fast_verify_forward(
-                    model, inp_next, prompt_cache, return_hidden=True, return_rollback=True
+                    model, inp_next, prompt_cache, return_hidden=True, return_rollback=True, capture_layers=lids
                 )
                 preds_next, lp_next = _logits_to_preds(logits_next)
-                mx.async_eval(preds_next, hidden_next, draft_mat_next, lp_next)
+                mx.async_eval(*_verify_eval_targets(preds_next, hidden_next, draft_mat_next, lp_next, rb_next))
 
                 inflight = {
                     "rb": rb_next,
@@ -513,13 +578,16 @@ def mtp_generate_step(
             if inflight is not None:
                 if cur_burst_rb is None and "hidden_next" in inflight:
                     # Caller broke on last token of burst (next_cur, which was inp_next[0]): commit nc=1.
-                    mx.eval(inflight["hidden_next"])
-                    commit_verify_cache(prompt_cache, inflight["rb"], 1)
+                    rb_i = inflight["rb"]
+                    cap_i = rb_i.get("captured")
+                    mx.eval(inflight["hidden_next"], cap_i) if cap_i is not None else mx.eval(inflight["hidden_next"])
+                    h_next_eff = mtp.apply_feat_fuse(inflight["hidden_next"], cap_i)
+                    commit_verify_cache(prompt_cache, rb_i, 1)
                     a0 = inflight["mtp_after0_offs"][0]
                     if mc.offset > a0:
                         mc.trim(mc.offset - a0)
                     if prompt_cache:
-                        prompt_cache[-1]._lingsante_mtp_state = (mc, inflight["hidden_next"][:, 0:1, :])
+                        prompt_cache[-1]._lingsante_mtp_state = (mc, h_next_eff[:, 0:1, :])
                 else:
                     mtp_cancel_inflight(inflight, [mc])
                 mx.synchronize(stream)
@@ -596,21 +664,32 @@ class LingSanteSpecBatch:
         mtp_states: list | None = None,
     ) -> "LingSanteSpecBatch":
         C = int(inputs.shape[0])
+        lids = getattr(mtp, "_feat_layers", None)
         if prompt_cache[0].empty():
-            hidden0 = model.model(inputs[:, None], cache=prompt_cache)
-            logits0 = model.lm_head(hidden0)
+            h_raw, hidden0 = mtp_target_prefill_hidden(
+                model, mtp, inputs[:, None], prompt_cache, return_raw=True
+            )
+            logits0 = model.lm_head(h_raw)
             vcache = mtp_vcache_from_standard(model, prompt_cache, C)
         else:
             vcache = mtp_vcache_from_standard(model, prompt_cache, C)
             if can_fast_verify(model, inputs[:, None], vcache):
                 logits0, hidden0, rb0 = fast_verify_forward(
-                    model, inputs[:, None], vcache, return_hidden=True, return_rollback=True
+                    model,
+                    inputs[:, None],
+                    vcache,
+                    return_hidden=True,
+                    return_rollback=True,
+                    capture_layers=lids,
                 )
                 commit_verify_cache(vcache, rb0, 1)
+                hidden0 = mtp.apply_feat_fuse(hidden0, rb0.get("captured"))
             else:
                 std_c = mtp_vcache_to_standard(model, vcache, C)
-                hidden0 = model.model(inputs[:, None], cache=std_c)
-                logits0 = model.lm_head(hidden0)
+                h_raw, hidden0 = mtp_target_prefill_hidden(
+                    model, mtp, inputs[:, None], std_c, return_raw=True
+                )
+                logits0 = model.lm_head(h_raw)
                 vcache = mtp_vcache_from_standard(model, std_c, C)
 
         nxt0, lp0 = _logits_to_preds(logits0[:, 0, :])
@@ -622,15 +701,7 @@ class LingSanteSpecBatch:
             st = mtp_states[i] if (mtp_states is not None and i < len(mtp_states)) else None
             mc, pending_h = st if st is not None else (KVCache(), None)
             if pending_h is not None:
-                mtp.step_rows(
-                    inputs[i : i + 1],
-                    pending_h[:, 0, :],
-                    mc,
-                    C=1,
-                    L=1,
-                    use_q4_head=True,
-                    return_logits=False,
-                )
+                mtp.kv_append(inputs[i : i + 1], pending_h[:, 0, :], mc)
                 mx.eval(mc.state)
             mtp_caches.append(mc)
             mtp_exact_offs.append(mc.offset)
@@ -703,8 +774,9 @@ class LingSanteSpecBatch:
         self.cur_lps.extend(other.cur_lps)
         self.cur_hidden = mx.concatenate([self.cur_hidden, other.cur_hidden], axis=0)
 
-    def _launch_cycle(self, K: int) -> None:
+    def _launch_cycle(self, K_limit: int) -> None:
         C = len(self.cur_toks)
+        lids = getattr(self.mtp, "_feat_layers", None)
         cur_arr = mx.array(self.cur_toks, dtype=mx.uint32)
         draft_mat, after0_offs = _chain_mtp_drafts(
             self.mtp,
@@ -712,16 +784,17 @@ class LingSanteSpecBatch:
             self.cur_hidden,
             self.mtp_caches,
             C=C,
-            K=K,
+            K_limit=K_limit,
             use_q4_head=True,
         )
+        K = int(draft_mat.shape[1])
         mx.async_eval(draft_mat)
         inp = mx.concatenate([cur_arr[:, None], draft_mat], axis=1)
         logits, hidden, rb = fast_verify_forward(
-            self.model, inp, self.vcache, return_hidden=True, return_rollback=True
+            self.model, inp, self.vcache, return_hidden=True, return_rollback=True, capture_layers=lids
         )
         preds, lp = _logits_to_preds(logits)
-        mx.async_eval(preds, hidden, draft_mat, lp)
+        mx.async_eval(*_verify_eval_targets(preds, hidden, draft_mat, lp, rb))
         self.mtp_exact_offs = after0_offs
         self.inflight = {
             "K": K,
@@ -738,24 +811,22 @@ class LingSanteSpecBatch:
         if C == 0:
             return []
 
+        lids = getattr(self.mtp, "_feat_layers", None)
         max_rem = max(gen_batch.max_tokens[i] - gen_batch._num_tokens[i] for i in range(C))
         if self.inflight is None and max_rem <= 1:
             # Every stream has 1 token left and its prediction + logprobs are already ready.
             fin_lps = list(self.cur_lps)
             cur_arr = mx.array(self.cur_toks, dtype=mx.uint32)
-            cache_arg = self.mtp_caches[0] if C == 1 else self.mtp_caches
-            self.mtp.step_rows(
-                cur_arr,
-                self.cur_hidden,
-                cache_arg,
-                C=C,
-                L=1,
-                use_q4_head=True,
-                return_logits=False,
-            )
+            self.mtp.kv_append_varlen(cur_arr, self.cur_hidden, self.mtp_caches, [1] * C)
             _, hidden_fin, rb_fin = fast_verify_forward(
-                self.model, cur_arr[:, None], self.vcache, return_hidden=True, return_rollback=True
+                self.model,
+                cur_arr[:, None],
+                self.vcache,
+                return_hidden=True,
+                return_rollback=True,
+                capture_layers=lids,
             )
+            hidden_fin = self.mtp.apply_feat_fuse(hidden_fin, rb_fin.get("captured"))
             mx.eval(hidden_fin, *[x for mc in self.mtp_caches for x in mc.state])
             commit_verify_cache(self.vcache, rb_fin, 1)
             responses = []
@@ -786,8 +857,7 @@ class LingSanteSpecBatch:
             return responses
 
         if self.inflight is None:
-            K = min(mtp_k_for_batch(C), max(1, max_rem - 1))
-            self._launch_cycle(K)
+            self._launch_cycle(max(1, max_rem - 1))
 
         inf = self.inflight
         K = inf["K"]
@@ -798,8 +868,9 @@ class LingSanteSpecBatch:
             inf["lp"],
             inf["rb"],
         )
-        mx.eval(preds, hidden, draft_mat, lp)
+        mx.eval(*_verify_eval_targets(preds, hidden, draft_mat, lp, rb))
         self.inflight = None
+        hidden = self.mtp.apply_feat_fuse(hidden, rb.get("captured"))
 
         pred_lists = preds.tolist()
         draft_lists = draft_mat.tolist()
@@ -866,15 +937,7 @@ class LingSanteSpecBatch:
                 nc_s = ncs[s]
                 if nc_s > 1:
                     mtp_d = mx.array(draft_lists[s][: nc_s - 1], dtype=mx.uint32)
-                    self.mtp.step_rows(
-                        mtp_d,
-                        hidden[s, : nc_s - 1, :],
-                        mc_s,
-                        C=1,
-                        L=nc_s - 1,
-                        use_q4_head=True,
-                        return_logits=False,
-                    )
+                    self.mtp.kv_append(mtp_d, hidden[s, : nc_s - 1, :], mc_s)
                 pending_h = hidden[s : s + 1, nc_s - 1 : nc_s, :]
                 mx.eval(mc_s.state, pending_h)
                 fin_caches[s] = mtp_extract_from_vcache(
@@ -945,7 +1008,7 @@ class LingSanteSpecBatch:
             gen_batch.max_tokens[i] - gen_batch._num_tokens[i] for i in range(C_act)
         )
         if prefetch and max_rem_next > 1:
-            K_next = min(mtp_k_for_batch(C_act), max_rem_next - 1)
+            K_lim = max(1, max_rem_next - 1)
             draft_mat_next, new_after0_offs = _sync_and_chain_mtp(
                 self.mtp,
                 hidden_kept,
@@ -955,9 +1018,10 @@ class LingSanteSpecBatch:
                 self.mtp_caches,
                 after0_kept,
                 C=C_act,
-                K=K_next,
+                K_limit=K_lim,
                 use_q4_head=True,
             )
+            K_next = int(draft_mat_next.shape[1])
             flush_arrs = [draft_mat_next]
             for li, layer in enumerate(self.model.model.layers):
                 if layer.is_linear:
@@ -967,10 +1031,10 @@ class LingSanteSpecBatch:
             cur_arr = mx.array(next_cur_toks, dtype=mx.uint32)
             inp_next = mx.concatenate([cur_arr[:, None], draft_mat_next], axis=1)
             logits_next, hidden_next, rb_next = fast_verify_forward(
-                self.model, inp_next, self.vcache, return_hidden=True, return_rollback=True
+                self.model, inp_next, self.vcache, return_hidden=True, return_rollback=True, capture_layers=lids
             )
             preds_next, lp_next = _logits_to_preds(logits_next)
-            mx.async_eval(preds_next, hidden_next, draft_mat_next, lp_next)
+            mx.async_eval(*_verify_eval_targets(preds_next, hidden_next, draft_mat_next, lp_next, rb_next))
             self.mtp_exact_offs = new_after0_offs
             self.inflight = {
                 "K": K_next,
@@ -1034,7 +1098,7 @@ def prefill_with_hidden(model, mtp: BailingMTPLayer, ids: Sequence[int], step: i
     pos = 0
     while p.size - pos > 1:
         n = min(step, p.size - 1 - pos)
-        h = model.model(p[pos : pos + n][None], cache=t_cache)
+        h = mtp_target_prefill_hidden(model, mtp, p[pos : pos + n][None], t_cache)
         mx.eval(h, [c.state for c in t_cache])
         h_chunks.append(h)
         pos += n
@@ -1046,10 +1110,73 @@ def prefill_with_hidden(model, mtp: BailingMTPLayer, ids: Sequence[int], step: i
         tot = tokens_shifted.shape[1]
         while s_pos < tot:
             m = min(step, tot - s_pos)
-            mtp_out = mtp.prefill(tokens_shifted[:, s_pos : s_pos + m], h_all[:, s_pos : s_pos + m, :], mtp_cache)
-            mx.eval(mtp_out, mtp_cache.state)
+            mtp.kv_append(tokens_shifted[:, s_pos : s_pos + m], h_all[:, s_pos : s_pos + m, :], mtp_cache)
+            mx.eval(mtp_cache.state)
             s_pos += m
     return t_cache, mtp_cache, int(p[-1].item())
+
+
+def _resolve_draft_policy(mtp: BailingMTPLayer, C: int, K: int | None, K_limit: int | None):
+    if K is not None:
+        draft_mode, k_cap, dyn_th, p1_min = "fixed", K, 0.0, 0.0
+    elif C <= 1:
+        draft_mode, k_cap, dyn_th, p1_min = mtp_c1_policy(mtp)
+    else:
+        draft_mode, k_cap, dyn_th, p1_min = "fixed", mtp_k_for_batch(C, mtp), 0.0, 0.0
+    if K_limit is not None:
+        k_cap = min(k_cap, max(1, int(K_limit)))
+    return draft_mode, max(1, int(k_cap)), dyn_th, p1_min
+
+
+def _draft_steps_from_logits(
+    mtp: BailingMTPLayer,
+    cache_arg,
+    *,
+    C: int,
+    K_cap: int,
+    dl0: mx.array,
+    h0_in: mx.array,
+    h0_out: mx.array,
+    draft_mode: str,
+    dyn_th: float,
+    p1_min: float,
+    use_q4_head: bool,
+) -> mx.array:
+    d_prev = mx.argmax(dl0, axis=-1)
+    cols = [d_prev]
+    if K_cap <= 1:
+        return mx.stack(cols, axis=1)
+    h_in = h0_in
+    h_d = h0_out
+    if draft_mode == "dyn_step" and C == 1:
+        lg_f = dl0[0].astype(mx.float32)
+        cum_p_mx = mx.exp(mx.max(lg_f) - mx.logsumexp(lg_f))
+        mx.eval(cum_p_mx)
+        p_val = float(cum_p_mx.item())
+        if p_val < p1_min or p_val < dyn_th:
+            return mx.stack(cols, axis=1)
+        for k_idx in range(1, K_cap):
+            h_in_next = mtp.apply_feedback_bridge(h_d, h_in)
+            h_d, dlk = mtp.step_rows(d_prev, h_in_next, cache_arg, C=1, L=1, use_q4_head=use_q4_head)
+            h_in = h_in_next
+            d_prev = mx.argmax(dlk, axis=-1)
+            cols.append(d_prev)
+            if k_idx + 1 < K_cap:
+                lg_f = dlk[0].astype(mx.float32)
+                p_k = mx.exp(mx.max(lg_f) - mx.logsumexp(lg_f))
+                cum_p_mx = cum_p_mx * p_k
+                mx.eval(cum_p_mx)
+                if float(cum_p_mx.item()) < dyn_th:
+                    break
+        return mx.stack(cols, axis=1)
+
+    for _ in range(1, K_cap):
+        h_in_next = mtp.apply_feedback_bridge(h_d, h_in)
+        h_d, dlk = mtp.step_rows(d_prev, h_in_next, cache_arg, C=C, L=1, use_q4_head=use_q4_head)
+        h_in = h_in_next
+        d_prev = mx.argmax(dlk, axis=-1)
+        cols.append(d_prev)
+    return mx.stack(cols, axis=1)
 
 
 def _chain_mtp_drafts(
@@ -1059,20 +1186,29 @@ def _chain_mtp_drafts(
     mtp_caches: list[KVCache],
     *,
     C: int,
-    K: int,
+    K: int | None = None,
+    K_limit: int | None = None,
     use_q4_head: bool,
 ) -> tuple[mx.array, list[int]]:
-    """Build all `K` MTP draft steps lazily on GPU (`0` intermediate evals)."""
+    """Build MTP draft steps on GPU (`dyn_step` at C=1 or fixed lazy chaining at C>=2)."""
+    draft_mode, k_cap, dyn_th, p1_min = _resolve_draft_policy(mtp, C, K, K_limit)
     cache_arg = mtp_caches[0] if C == 1 else mtp_caches
     h_d, dl0 = mtp.step_rows(first_toks, first_hidden, cache_arg, C=C, L=1, use_q4_head=use_q4_head)
     exact_offs = [mc.offset for mc in mtp_caches]
-    d_prev = mx.argmax(dl0, axis=-1)
-    cols = [d_prev]
-    for _ in range(1, K):
-        h_d, dlk = mtp.step_rows(d_prev, h_d, cache_arg, C=C, L=1, use_q4_head=use_q4_head)
-        d_prev = mx.argmax(dlk, axis=-1)
-        cols.append(d_prev)
-    return mx.stack(cols, axis=1), exact_offs
+    draft_mat = _draft_steps_from_logits(
+        mtp,
+        cache_arg,
+        C=C,
+        K_cap=k_cap,
+        dl0=dl0,
+        h0_in=first_hidden,
+        h0_out=h_d,
+        draft_mode=draft_mode,
+        dyn_th=dyn_th,
+        p1_min=p1_min,
+        use_q4_head=use_q4_head,
+    )
+    return draft_mat, exact_offs
 
 
 def _sync_and_chain_mtp(
@@ -1085,40 +1221,51 @@ def _sync_and_chain_mtp(
     mtp_exact_offs: list[int],
     *,
     C: int,
-    K: int,
+    K: int | None = None,
+    K_limit: int | None = None,
     use_q4_head: bool,
 ) -> tuple[mx.array, list[int]]:
-    """Trim unaccepted MTP KV entries, refresh true target hidden states grouped by `nc`, and chain remaining `K-1` drafts lazily."""
+    """Trim unaccepted MTP KV entries, KV-append accepted drafts `[0..nc-2]`, step `cur_toks`, and chain remaining drafts."""
+    draft_mode, k_cap, dyn_th, p1_min = _resolve_draft_policy(mtp, C, K, K_limit)
     for c in range(C):
         tr = mtp_caches[c].offset - mtp_exact_offs[c]
         if tr > 0:
             mtp_caches[c].trim(tr)
 
-    if len(set(ncs)) == 1:
-        nc = ncs[0]
-        toks_g = mx.array([draft_lists[c][: nc - 1] + [cur_toks[c]] for c in range(C)], dtype=mx.uint32)
-        hs_g = hidden[:, :nc, :]
-        cache_arg = mtp_caches[0] if C == 1 else mtp_caches
-        h_d, dl0 = mtp.step_rows(toks_g, hs_g, cache_arg, C=C, L=nc, use_q4_head=use_q4_head)
-        new_exact_offs = [mc.offset for mc in mtp_caches]
-        d_prev = mx.argmax(dl0, axis=-1)
-    else:
-        toks_flat = mx.array(
-            [tok for c, nc in enumerate(ncs) for tok in (draft_lists[c][: nc - 1] + [cur_toks[c]])],
-            dtype=mx.uint32,
+    need = [(c, nc - 1) for c, nc in enumerate(ncs) if nc > 1]
+    if len(need) == 1:
+        ci, Lc = need[0]
+        mtp.kv_append(mx.array(draft_lists[ci][:Lc], dtype=mx.uint32), hidden[ci, :Lc, :], mtp_caches[ci])
+    elif len(need) > 1:
+        toks_flat = mx.array([tok for ci, Lc in need for tok in draft_lists[ci][:Lc]], dtype=mx.uint32)
+        hs_flat = mx.concatenate([hidden[ci, :Lc, :] for ci, Lc in need], axis=0)
+        mtp.kv_append_varlen(
+            toks_flat, hs_flat, [mtp_caches[ci] for ci, _ in need], [Lc for _, Lc in need]
         )
-        hs_flat = mx.concatenate([hidden[c, :nc, :] for c, nc in enumerate(ncs)], axis=0)
-        h_d, dl0 = mtp.step_varlen_rows(toks_flat, hs_flat, mtp_caches, ncs, use_q4_head=use_q4_head)
-        new_exact_offs = [mc.offset for mc in mtp_caches]
-        d_prev = mx.argmax(dl0, axis=-1)
 
-    cols = [d_prev]
+    cur_arr = mx.array(cur_toks, dtype=mx.uint32)
+    cur_hs = (
+        hidden[:, ncs[0] - 1, :]
+        if len(set(ncs)) == 1
+        else mx.stack([hidden[c, nc - 1, :] for c, nc in enumerate(ncs)], axis=0)
+    )
     cache_arg = mtp_caches[0] if C == 1 else mtp_caches
-    for _ in range(1, K):
-        h_d, dlk = mtp.step_rows(d_prev, h_d, cache_arg, C=C, L=1, use_q4_head=use_q4_head)
-        d_prev = mx.argmax(dlk, axis=-1)
-        cols.append(d_prev)
-    return mx.stack(cols, axis=1), new_exact_offs
+    h_d, dl0 = mtp.step_rows(cur_arr, cur_hs, cache_arg, C=C, L=1, use_q4_head=use_q4_head)
+    new_exact_offs = [mc.offset for mc in mtp_caches]
+    draft_mat = _draft_steps_from_logits(
+        mtp,
+        cache_arg,
+        C=C,
+        K_cap=k_cap,
+        dl0=dl0,
+        h0_in=cur_hs,
+        h0_out=h_d,
+        draft_mode=draft_mode,
+        dyn_th=dyn_th,
+        p1_min=p1_min,
+        use_q4_head=use_q4_head,
+    )
+    return draft_mat, new_exact_offs
 
 
 def _logits_to_preds(logits: mx.array):
@@ -1156,7 +1303,7 @@ def run_mtp_spec_greedy(
     mtp: BailingMTPLayer,
     prompts_ids: Sequence[Sequence[int]],
     *,
-    K: int,
+    K: int | None = None,
     max_tokens: int = 128,
     use_q4_head: bool = True,
     prefill_step: int = 512,
@@ -1164,7 +1311,8 @@ def run_mtp_spec_greedy(
 ):
     """Single-sync async-pipelined greedy speculative decode for `1 <= C <= 4` streams with contraction."""
     C = len(prompts_ids)
-    assert 1 <= C <= 4 and K >= 1 and C * (K + 1) <= 24
+    assert 1 <= C <= 4
+    lids = getattr(mtp, "_feat_layers", None)
 
     t_caches, mtp_caches, last_toks = [], [], []
     for ids in prompts_ids:
@@ -1177,8 +1325,14 @@ def run_mtp_spec_greedy(
 
     # Initial L=1 target forward on last prompt token
     logits0, hidden0, rb0 = fast_verify_forward(
-        model, mx.array([[lt] for lt in last_toks], dtype=mx.uint32), vcache, return_hidden=True, return_rollback=True
+        model,
+        mx.array([[lt] for lt in last_toks], dtype=mx.uint32),
+        vcache,
+        return_hidden=True,
+        return_rollback=True,
+        capture_layers=lids,
     )
+    hidden0 = mtp.apply_feat_fuse(hidden0, rb0.get("captured"))
     nxt0, lp0 = _logits_to_preds(logits0[:, 0, :])
     mx.eval(nxt0, hidden0, lp0)
     commit_verify_cache(vcache, rb0, 1)
@@ -1191,13 +1345,16 @@ def run_mtp_spec_greedy(
     draft_mat, mtp_exact_offs = _chain_mtp_drafts(
         mtp, nxt0, hidden0[:, 0, :], mtp_caches, C=C, K=K, use_q4_head=use_q4_head
     )
+    K_cur = int(draft_mat.shape[1])
     inp = mx.concatenate([nxt0[:, None], draft_mat], axis=1)
-    logits, hidden, rb = fast_verify_forward(model, inp, vcache, return_hidden=True, return_rollback=True)
+    logits, hidden, rb = fast_verify_forward(
+        model, inp, vcache, return_hidden=True, return_rollback=True, capture_layers=lids
+    )
     preds, lp = _logits_to_preds(logits)
 
     mx.reset_peak_memory()
     t_start = time.perf_counter()
-    mx.async_eval(preds, hidden, draft_mat, lp)
+    mx.async_eval(*_verify_eval_targets(preds, hidden, draft_mat, lp, rb))
 
     C_act = C
     active_orig = list(range(C))
@@ -1206,11 +1363,13 @@ def run_mtp_spec_greedy(
     sum_emitted = 0
     steady_emitted = 0
     steady_wall_s = None
-    hits = [0] * K
-    trials = [0] * K
+    max_pos = K if K is not None else 7
+    hits = [0] * max_pos
+    trials = [0] * max_pos
 
     while True:
-        mx.eval(preds, hidden, draft_mat, lp)
+        mx.eval(*_verify_eval_targets(preds, hidden, draft_mat, lp, rb))
+        hidden = mtp.apply_feat_fuse(hidden, rb.get("captured"))
         pred_lists = preds.tolist()
         draft_lists = draft_mat.tolist()
 
@@ -1222,10 +1381,12 @@ def run_mtp_spec_greedy(
         for s in range(C_act):
             orig = active_orig[s]
             a = 0
-            for j in range(K):
-                trials[j] += 1
+            for j in range(K_cur):
+                if j < max_pos:
+                    trials[j] += 1
                 if pred_lists[s][j] == draft_lists[s][j]:
-                    hits[j] += 1
+                    if j < max_pos:
+                        hits[j] += 1
                     a += 1
                 else:
                     break
@@ -1290,6 +1451,7 @@ def run_mtp_spec_greedy(
             K=K,
             use_q4_head=use_q4_head,
         )
+        K_next = int(draft_mat_next.shape[1])
         flush_arrs = [draft_mat_next]
         for li, layer in enumerate(model.model.layers):
             if layer.is_linear:
@@ -1299,17 +1461,24 @@ def run_mtp_spec_greedy(
         cur_arr = mx.array(next_cur_toks, dtype=mx.uint32)
         inp_next = mx.concatenate([cur_arr[:, None], draft_mat_next], axis=1)
         logits_next, hidden_next, rb_next = fast_verify_forward(
-            model, inp_next, vcache, return_hidden=True, return_rollback=True
+            model, inp_next, vcache, return_hidden=True, return_rollback=True, capture_layers=lids
         )
         preds_next, lp_next = _logits_to_preds(logits_next)
-        mx.async_eval(preds_next, hidden_next, draft_mat_next, lp_next)
+        mx.async_eval(*_verify_eval_targets(preds_next, hidden_next, draft_mat_next, lp_next, rb_next))
 
         # CPU work overlapped with GPU execution of cycle s+1
         for s, orig in enumerate(old_active_orig):
             emitted[orig].extend(pending_tokens[s])
             lp_arrays[orig].extend(pending_lps[s])
 
-        preds, hidden, draft_mat, lp, rb = preds_next, hidden_next, draft_mat_next, lp_next, rb_next
+        preds, hidden, draft_mat, lp, rb, K_cur = (
+            preds_next,
+            hidden_next,
+            draft_mat_next,
+            lp_next,
+            rb_next,
+            K_next,
+        )
 
     wall_dt = time.perf_counter() - t_start
     gen_toks = sum(len(e) - 1 for e in emitted)
@@ -1327,6 +1496,6 @@ def run_mtp_spec_greedy(
         "steady_tok_s": steady_tps,
         "per_stream_tok_s": (gen_toks / wall_dt) / C,
         "E_acc": sum_emitted / active_stream_steps,
-        "alphas": [round(hits[j] / trials[j], 3) if trials[j] > 0 else 0.0 for j in range(K)],
+        "alphas": [round(hits[j] / trials[j], 3) if trials[j] > 0 else 0.0 for j in range(max_pos)],
         "peak_gb": round(mx.get_peak_memory() / 1e9, 2),
     }

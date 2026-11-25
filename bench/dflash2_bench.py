@@ -559,6 +559,7 @@ def main():
     ap.add_argument("--out", default=os.path.expanduser("~/science/runs/dflash2_phase1.json"))
     ap.add_argument("--ledger-only", action="store_true")
     ap.add_argument("--q4-b8-only", action="store_true")
+    ap.add_argument("--eval-ft", action="store_true")
     ap.add_argument("--ledger-ls", default="8,12,16,20,24")
     a = ap.parse_args()
 
@@ -635,6 +636,73 @@ def main():
         mx.clear_cache()
         print(f"\n=== Target C=1 Verification Ledger L={ledger_ls} ===", flush=True)
         out["verify_ledger"] = profile_c1_verify_range(model, prompts_data, Ls=ledger_ls)
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(json.dumps(out, indent=1))
+        print(f"\nSaved {a.out}", flush=True)
+        return
+
+    if a.eval_ft:
+        dflash4 = DFlash2DraftModel.from_target(model, a.dflash, quant_bits=4, with_q4_head=True)
+        layer_ids = dflash4.target_layer_ids
+        out["layer_ids"] = list(layer_ids)
+        out["dflash_path"] = a.dflash
+        print(f"\n=== Adapted DFlash2 4-bit + q4_head Evaluation ({mx.get_active_memory()/1e9:.1f} GB) ===", flush=True)
+
+        def eval_ft_cfg(name, *, block_size=8, max_tokens=a.tokens, measure_phases=False):
+            rows = []
+            for nm in prompt_names:
+                r = run_dflash_c1_prompt(
+                    model, dflash4, prompts_data[nm]["ids"],
+                    block_size=block_size, use_q4_head=True, use_selector=True,
+                    max_tokens=max_tokens, layer_ids=layer_ids, measure_phases=measure_phases,
+                )
+                td, ld = verify_exact(r["emitted"], r["lp_arrays"], prompts_data[nm], max_tokens)
+                assert td == 0 and ld == 0, f"{name}/{nm} exactness failed: td={td}, ld={ld}"
+                row = {
+                    "prompt": nm, "tok_s": round(r["tok_s"], 2), "E_acc": round(r["E_acc"], 3),
+                    "cycle_ms": round(r["cycle_ms"], 2), "alphas": r["alphas"], "td": td, "ld": ld, "peak_gb": r["peak_gb"],
+                }
+                if measure_phases:
+                    row.update(draft_ms=round(r["draft_ms"], 2), verify_ms=round(r["verify_ms"], 2), commit_ms=round(r["commit_ms"], 2))
+                rows.append(row)
+            rec = {
+                "name": name, "block_size": block_size, "use_q4_head": True, "use_selector": True, "max_tokens": max_tokens,
+                "med_tok_s": round(statistics.median(x["tok_s"] for x in rows), 2),
+                "mean_E_acc": round(statistics.mean(x["E_acc"] for x in rows), 3),
+                "med_cycle_ms": round(statistics.median(x["cycle_ms"] for x in rows), 2),
+                "exact": True, "rows": rows,
+            }
+            if measure_phases:
+                rec["med_draft_ms"] = round(statistics.median(x["draft_ms"] for x in rows), 2)
+                rec["med_verify_ms"] = round(statistics.median(x["verify_ms"] for x in rows), 2)
+                rec["med_commit_ms"] = round(statistics.median(x["commit_ms"] for x in rows), 2)
+                print(
+                    f"  [{name:28s}] med={rec['med_tok_s']:6.2f} tok/s  E_acc={rec['mean_E_acc']:.3f}  "
+                    f"cyc={rec['med_cycle_ms']:6.2f}ms (draft={rec['med_draft_ms']:.2f} verify={rec['med_verify_ms']:.2f} commit={rec['med_commit_ms']:.2f})  exact=True",
+                    flush=True,
+                )
+            else:
+                per_p = " ".join(f"{r['prompt'][:5]}={r['tok_s']:.1f}({r['E_acc']:.2f})" for r in rows)
+                print(
+                    f"  [{name:28s}] med={rec['med_tok_s']:6.2f} tok/s  E_acc={rec['mean_E_acc']:.3f}  "
+                    f"cyc={rec['med_cycle_ms']:6.2f}ms  [{per_p}]  exact=True",
+                    flush=True,
+                )
+            out["configs"].append(rec)
+            return rec
+
+        best_rec = None
+        for bs in (8, 10, 12, 16):
+            r = eval_ft_cfg(f"q4_q4head_sel_B{bs}_async", block_size=bs)
+            if best_rec is None or r["med_tok_s"] > best_rec["med_tok_s"]:
+                best_rec = r
+        eval_ft_cfg("q4_q4head_sel_B8_phases", block_size=8, measure_phases=True)
+        eval_ft_cfg(f"q4_best_B{best_rec['block_size']}_256tok", block_size=best_rec["block_size"], max_tokens=256)
+
+        print("\n=== Oracle UBTree Potential Analysis (Adapted DFlash2 q4, B_tree = 8..32) ===", flush=True)
+        out["oracle_ubtree"] = run_oracle_ubtree_analysis(model, dflash4, prompts_data, prompt_names, use_q4_head=True, max_tokens=128)
+        print("  Oracle UBTree:", json.dumps(out["oracle_ubtree"]), flush=True)
+
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
         Path(a.out).write_text(json.dumps(out, indent=1))
         print(f"\nSaved {a.out}", flush=True)

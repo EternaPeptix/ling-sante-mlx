@@ -1331,6 +1331,7 @@ class PromptProcessingBatch:
             from .models.bailing_moe_v3.spec_engine import (
                 get_lingsante_mtp,
                 mtp_prefill_chunk,
+                mtp_target_prefill_hidden,
             )
 
             mtp = get_lingsante_mtp(self.model)
@@ -1340,7 +1341,7 @@ class PromptProcessingBatch:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             chunk = tokens[:, :n_to_process]
             if mtp is not None:
-                h = self.model.model(chunk, cache=self.prompt_cache)
+                h = mtp_target_prefill_hidden(self.model, mtp, chunk, self.prompt_cache)
                 mx.eval(h, [c.state for c in self.prompt_cache])
                 self._mtp_states[0] = mtp_prefill_chunk(
                     mtp, chunk, h, self._mtp_states[0]

@@ -55,7 +55,7 @@ _HEADER = (
     + r"""
 struct Bf4 { ushort v[4]; };
 
-template <typename T, typename XT, int B, int BSG, int B_SUB, int BM_M, int TM, int RES, int SWIGLU, int KK>
+template <typename T, typename XT, int B, int BSG, int B_SUB, int BM_M, int TM, int RES, int SWIGLU, int COOP, int KK>
 METAL_FUNC void bailing_gemv_fp8_rows_run(
     const device uchar* mat,
     const device float* sc_mat,
@@ -65,6 +65,7 @@ METAL_FUNC void bailing_gemv_fp8_rows_run(
     const device T* res_vec,   // (B, N) row-major when RES == 1
     device T* out_vec,         // (B, N) row-major
     const int N,
+    threadgroup bfloat16_t* w_tg,
     uint tgx,
     uint simd_gid,
     uint simd_lid) {
@@ -73,14 +74,15 @@ METAL_FUNC void bailing_gemv_fp8_rows_run(
   constexpr int blockN = SN * TN;  // 128 == FP8 scale block size!
   constexpr int blockM = BM_M * TM;
   constexpr int k_blocks = KK >> 7;
+  constexpr int TOT_R = SWIGLU ? (2 * TM) : TM;
 
   const int m_sg = int(simd_gid) / BSG;
   const int b_sg = int(simd_gid) % BSG;
   const int b0 = b_sg * B_SUB;
 
   int out_row = int(tgx) * blockM + m_sg * TM;
-  if (out_row >= N) return;
-  out_row = out_row + TM <= N ? out_row : N - TM;
+  const bool row_valid = (out_row < N);
+  out_row = row_valid ? (out_row + TM <= N ? out_row : N - TM) : 0;
 
   // 128 % TM == 0 and out_row is a multiple of TM (when N % TM == 0), so all TM rows share one scale row.
   const int row_blk = out_row >> 7;
@@ -107,20 +109,52 @@ METAL_FUNC void bailing_gemv_fp8_rows_run(
     const float sc_u = SWIGLU ? sc_up[i] : 0.0f;
     float wf[TM][4];
     float wf_u[SWIGLU ? TM : 1][SWIGLU ? 4 : 1];
+    if constexpr (COOP) {
+      threadgroup bfloat16_t* my_w = w_tg + (size_t(i & 1) * BM_M + m_sg) * (TOT_R * 128);
+      for (int ridx = b_sg; ridx < TOT_R; ridx += BSG) {
+        const bool is_u = SWIGLU && (ridx >= TM);
+        const int tm = is_u ? (ridx - TM) : ridx;
+        const device uchar* mp = is_u ? mat_up : mat;
+        const float sc_r = is_u ? sc_u : sc;
+        const uchar4 pk = *(const device uchar4*)(mp + size_t(tm) * KK + bn);
+        const int off = ridx * 128 + int(simd_lid) * 4;
+        my_w[off + 0] = static_cast<bfloat16_t>(E4M3_LUT[pk.x] * sc_r);
+        my_w[off + 1] = static_cast<bfloat16_t>(E4M3_LUT[pk.y] * sc_r);
+        my_w[off + 2] = static_cast<bfloat16_t>(E4M3_LUT[pk.z] * sc_r);
+        my_w[off + 3] = static_cast<bfloat16_t>(E4M3_LUT[pk.w] * sc_r);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-    for (int tm = 0; tm < TM; tm++) {
-      const size_t mo = size_t(tm) * KK + bn;
-      uchar4 pk = *(const device uchar4*)(mat + mo);
-      wf[tm][0] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.x] * sc));
-      wf[tm][1] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.y] * sc));
-      wf[tm][2] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.z] * sc));
-      wf[tm][3] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.w] * sc));
-      if constexpr (SWIGLU) {
-        uchar4 pku = *(const device uchar4*)(mat_up + mo);
-        wf_u[tm][0] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pku.x] * sc_u));
-        wf_u[tm][1] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pku.y] * sc_u));
-        wf_u[tm][2] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pku.z] * sc_u));
-        wf_u[tm][3] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pku.w] * sc_u));
+      for (int tm = 0; tm < TM; tm++) {
+        const int off = tm * 128 + int(simd_lid) * 4;
+        wf[tm][0] = static_cast<float>(my_w[off + 0]);
+        wf[tm][1] = static_cast<float>(my_w[off + 1]);
+        wf[tm][2] = static_cast<float>(my_w[off + 2]);
+        wf[tm][3] = static_cast<float>(my_w[off + 3]);
+        if constexpr (SWIGLU) {
+          const int off_u = (TM + tm) * 128 + int(simd_lid) * 4;
+          wf_u[tm][0] = static_cast<float>(my_w[off_u + 0]);
+          wf_u[tm][1] = static_cast<float>(my_w[off_u + 1]);
+          wf_u[tm][2] = static_cast<float>(my_w[off_u + 2]);
+          wf_u[tm][3] = static_cast<float>(my_w[off_u + 3]);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int tm = 0; tm < TM; tm++) {
+        const size_t mo = size_t(tm) * KK + bn;
+        uchar4 pk = *(const device uchar4*)(mat + mo);
+        wf[tm][0] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.x] * sc));
+        wf[tm][1] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.y] * sc));
+        wf[tm][2] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.z] * sc));
+        wf[tm][3] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pk.w] * sc));
+        if constexpr (SWIGLU) {
+          uchar4 pku = *(const device uchar4*)(mat_up + mo);
+          wf_u[tm][0] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pku.x] * sc_u));
+          wf_u[tm][1] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pku.y] * sc_u));
+          wf_u[tm][2] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pku.z] * sc_u));
+          wf_u[tm][3] = static_cast<float>(static_cast<bfloat16_t>(E4M3_LUT[pku.w] * sc_u));
+        }
       }
     }
 #pragma unroll
@@ -163,7 +197,7 @@ METAL_FUNC void bailing_gemv_fp8_rows_run(
     }
   }
 
-  if (simd_lid == 0) {
+  if (row_valid && simd_lid == 0) {
 #pragma unroll
     for (int bi = 0; bi < B_SUB; bi++) {
       const int b = b0 + bi;
@@ -282,7 +316,6 @@ def dequant_fp8_multilinear_to_bf16(w_fp8: mx.array, scale_inv: mx.array, scale_
 
 def _fp8_cfg(N: int, K: int, B: int, is_swiglu: bool = False):
     """Empirically tuned `(bsg, b_sub, bm_m, tm)` per B regime on M3 Ultra."""
-    del K
     env = os.environ.get("LINGSANTE_FP8_CFG")
     if env:
         bsg, bm_m, tm = (int(v) for v in env.split(","))
@@ -298,10 +331,14 @@ def _fp8_cfg(N: int, K: int, B: int, is_swiglu: bool = False):
             bsg, bm_m, tm = 1, 4, 2
         elif B <= 8:
             bsg, bm_m, tm = 1, 4, 1
-        elif B <= 12:
+        elif B == 9:
             bsg, bm_m, tm = 2, 4, 1
-        elif B <= 16:
+        elif B <= 12:
             bsg, bm_m, tm = 2, 2, 1
+        elif B <= 16:
+            bsg, bm_m, tm = 2, 4, 1
+        elif B <= 20:
+            bsg, bm_m, tm = 3, 2, 1
         else:
             bsg, bm_m, tm = 4, 2, 1
     else:
@@ -310,12 +347,12 @@ def _fp8_cfg(N: int, K: int, B: int, is_swiglu: bool = False):
             bsg, bm_m, tm = 1, bm_large, 4
         elif B <= 8:
             bsg, bm_m, tm = 1, bm_large, 2
-        elif B <= 12:
-            bsg, bm_m, tm = 2, 4, 2
-        elif B <= 16:
+        elif B <= 10:
             bsg, bm_m, tm = 2, 2, 2
+        elif B <= 16:
+            bsg, bm_m, tm = 2, (2 if K > N else 4), 2
         else:
-            bsg, bm_m, tm = 4, 2, 2
+            bsg, bm_m, tm = (3 if K > N else 4), 2, 2
     if N < tm:
         tm = 1
     b_sub = (B + bsg - 1) // bsg
@@ -326,14 +363,36 @@ def _tname(dt):
     return {mx.bfloat16: "bfloat16_t", mx.float32: "float", mx.float16: "half"}[dt]
 
 
-def _build_fp8_group(out_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=False):
-    key = ("fp8", out_dt, x_dt, B, G, tuple(Ns), K, cfg, has_res, is_swiglu)
+def _can_coop(bsg: int, bm_m: int, tm: int, is_swiglu: bool = False) -> bool:
+    tot_r = (2 * tm) if is_swiglu else tm
+    return bsg > 1 and (tot_r % bsg == 0) and (bm_m * tot_r * 512 <= 16384)
+
+
+def _resolve_coop(cfg, is_swiglu: bool, coop: bool | None) -> bool:
+    bsg, _, bm_m, tm = cfg
+    if coop is not None:
+        use_c = bool(coop)
+        assert not use_c or _can_coop(bsg, bm_m, tm, is_swiglu), (
+            f"COOP unsupported for cfg={cfg}, is_swiglu={is_swiglu}"
+        )
+        return use_c
+    return False
+
+
+def _build_fp8_group(out_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=False, coop=False):
+    use_coop = int(bool(coop))
+    key = ("fp8", out_dt, x_dt, B, G, tuple(Ns), K, cfg, has_res, is_swiglu, use_coop)
     if key in _KERNELS:
         return _KERNELS[key]
     bsg, b_sub, bm_m, tm = cfg
     blockM = bm_m * tm
     T, XT = _tname(out_dt), _tname(x_dt)
-    lines = ["const uint t = threadgroup_position_in_grid.x;"]
+    tot_r = (2 * tm) if is_swiglu else tm
+    tg_elems = (2 * bm_m * tot_r * 128) if use_coop else 1
+    lines = [
+        f"threadgroup bfloat16_t w_tg[{tg_elems}];",
+        "const uint t = threadgroup_position_in_grid.x;",
+    ]
     if G == 1:
         N0 = Ns[0]
         nt = (N0 + blockM - 1) // blockM
@@ -341,8 +400,8 @@ def _build_fp8_group(out_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=Fa
         sup = "su0" if is_swiglu else "s0"
         rv = "res" if has_res else "out0"
         lines.append(
-            f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {K}>"
-            f"(w0, s0, {wup}, {sup}, x0, {rv}, out0, {N0}, t, "
+            f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {use_coop}, {K}>"
+            f"(w0, s0, {wup}, {sup}, x0, {rv}, out0, {N0}, w_tg, t, "
             f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
         )
         start = nt
@@ -374,8 +433,8 @@ def _build_fp8_group(out_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=Fa
                 )
             start += nt
         lines.append(
-            f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {K}>"
-            f"(wp, sp, up_p, sup_p, xp, rp, op, n_cur, t_loc, "
+            f"bailing_gemv_fp8_rows_run<{T}, {XT}, {B}, {bsg}, {b_sub}, {bm_m}, {tm}, {int(has_res)}, {int(is_swiglu)}, {use_coop}, {K}>"
+            f"(wp, sp, up_p, sup_p, xp, rp, op, n_cur, w_tg, t_loc, "
             f"simdgroup_index_in_threadgroup, thread_index_in_simdgroup);"
         )
     in_names = [f"w{g}" for g in range(G)] + [f"s{g}" for g in range(G)]
@@ -385,7 +444,7 @@ def _build_fp8_group(out_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=Fa
     if has_res:
         in_names.append("res")
     out_names = [f"out{g}" for g in range(G)]
-    tag = f"{out_dt}_{x_dt}_b{B}_g{G}_k{K}_r{int(has_res)}_s{int(is_swiglu)}_{'_'.join(map(str, Ns + list(cfg)))}"
+    tag = f"{out_dt}_{x_dt}_b{B}_g{G}_k{K}_r{int(has_res)}_s{int(is_swiglu)}_c{use_coop}_{'_'.join(map(str, Ns + list(cfg)))}"
     tag = tag.replace("mlx.core.", "")
     kern = mx.fast.metal_kernel(
         name=f"bv3_gemv_fp8_{tag}",
@@ -399,7 +458,7 @@ def _build_fp8_group(out_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=Fa
     return _KERNELS[key]
 
 
-def gemv_fp8_rows_group(xs, ws_fp8, scs, *, cfg=None):
+def gemv_fp8_rows_group(xs, ws_fp8, scs, *, cfg=None, coop=None):
     """Independent problems out_i = xs[i] @ bf16(fp8_i * sc_i).T."""
     xs, ws_fp8, scs = list(xs), list(ws_fp8), list(scs)
     B, K = xs[0].shape
@@ -416,16 +475,19 @@ def gemv_fp8_rows_group(xs, ws_fp8, scs, *, cfg=None):
                 idx = [i for i, cc in enumerate(cfgs) if cc == c]
                 for i, o in zip(
                     idx,
-                    gemv_fp8_rows_group([xs[i] for i in idx], [ws_fp8[i] for i in idx], [scs[i] for i in idx], cfg=c),
+                    gemv_fp8_rows_group(
+                        [xs[i] for i in idx], [ws_fp8[i] for i in idx], [scs[i] for i in idx], cfg=c, coop=coop
+                    ),
                 ):
                     out[i] = o
             return out
         cfg = cfgs[0]
     bsg, _, bm_m, tm = cfg
+    use_coop = _resolve_coop(cfg, False, coop)
     Ns = [w.shape[0] for w in ws_fp8]
     assert all(n % tm == 0 for n in Ns), f"Ns={Ns} not divisible by tm={tm}"
     G = len(ws_fp8)
-    kern, ntg = _build_fp8_group(dt, dt, B, G, Ns, K, cfg)
+    kern, ntg = _build_fp8_group(dt, dt, B, G, Ns, K, cfg, coop=use_coop)
     nsg = bsg * bm_m
     return list(
         kern(
@@ -438,11 +500,11 @@ def gemv_fp8_rows_group(xs, ws_fp8, scs, *, cfg=None):
     )
 
 
-def gemv_fp8_rows(x, w_fp8, sc, *, cfg=None):
-    return gemv_fp8_rows_group([x], [w_fp8], [sc], cfg=cfg)[0]
+def gemv_fp8_rows(x, w_fp8, sc, *, cfg=None, coop=None):
+    return gemv_fp8_rows_group([x], [w_fp8], [sc], cfg=cfg, coop=coop)[0]
 
 
-def gemv_fp8_rows_res(x, w_fp8, sc, res, *, cfg=None):
+def gemv_fp8_rows_res(x, w_fp8, sc, res, *, cfg=None, coop=None):
     B, K = x.shape
     N = w_fp8.shape[0]
     dt = x.dtype
@@ -451,8 +513,9 @@ def gemv_fp8_rows_res(x, w_fp8, sc, res, *, cfg=None):
     if cfg is None:
         cfg = _fp8_cfg(N, K, B, False)
     bsg, _, bm_m, tm = cfg
+    use_coop = _resolve_coop(cfg, False, coop)
     assert N % tm == 0
-    kern, ntg = _build_fp8_group(dt, dt, B, 1, [N], K, cfg, has_res=True)
+    kern, ntg = _build_fp8_group(dt, dt, B, 1, [N], K, cfg, has_res=True, coop=use_coop)
     nsg = bsg * bm_m
     return kern(
         inputs=[w_fp8, sc, x, res],
@@ -463,7 +526,7 @@ def gemv_fp8_rows_res(x, w_fp8, sc, res, *, cfg=None):
     )[0]
 
 
-def gemv_fp8_swiglu_rows(x, wg_fp8, sc_g, wu_fp8, sc_u, *, cfg=None):
+def gemv_fp8_swiglu_rows(x, wg_fp8, sc_g, wu_fp8, sc_u, *, cfg=None, coop=None):
     B, K = x.shape
     N = wg_fp8.shape[0]
     assert 1 <= B <= MAX_B and K % 128 == 0 and x.dtype == mx.bfloat16
@@ -472,8 +535,9 @@ def gemv_fp8_swiglu_rows(x, wg_fp8, sc_g, wu_fp8, sc_u, *, cfg=None):
     if cfg is None:
         cfg = _fp8_cfg(N, K, B, True)
     bsg, _, bm_m, tm = cfg
+    use_coop = _resolve_coop(cfg, True, coop)
     assert N % tm == 0
-    kern, ntg = _build_fp8_group(mx.bfloat16, mx.bfloat16, B, 1, [N], K, cfg, is_swiglu=True)
+    kern, ntg = _build_fp8_group(mx.bfloat16, mx.bfloat16, B, 1, [N], K, cfg, is_swiglu=True, coop=use_coop)
     nsg = bsg * bm_m
     return kern(
         inputs=[wg_fp8, sc_g, wu_fp8, sc_u, x],

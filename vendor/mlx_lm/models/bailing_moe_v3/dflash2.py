@@ -34,33 +34,46 @@ class DFlashGroupedConv(nn.Module):
             self.hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
 
-    def _convolve(self, hidden_states: mx.array, delta: mx.array, *, side: int) -> mx.array:
+    def _convolve(
+        self,
+        hidden_states: mx.array,
+        delta: mx.array,
+        *,
+        side: int,
+        block_size: int | None = None,
+    ) -> mx.array:
         B, L, H = hidden_states.shape
-        blocks = hidden_states.reshape(B, L, self.num_groups, self.group_size)
-        dyn = delta.reshape(B, L, self.taps, self.num_groups)[..., None]
-        base = self.base_kernel[side].reshape(1, 1, self.taps, self.num_groups, self.group_size)
+        bs = L if block_size is None else int(block_size)
+        n_blk = L // bs
+        blocks = hidden_states.reshape(B, n_blk, bs, self.num_groups, self.group_size)
+        dyn = delta.reshape(B, n_blk, bs, self.taps, self.num_groups)[..., None]
+        base = self.base_kernel[side].reshape(1, 1, 1, self.taps, self.num_groups, self.group_size)
         coeffs = base + dyn.astype(base.dtype)
-        out = coeffs[:, :, 0] * blocks
-        for tap in range(1, self.taps):
-            if tap >= L:
-                break
-            shifted = mx.concatenate(
-                [mx.zeros((B, tap, self.num_groups, self.group_size), dtype=blocks.dtype), blocks[:, : L - tap]],
-                axis=1,
-            )
-            out = out + coeffs[:, :, tap] * shifted
+        out = coeffs[:, :, :, 0] * blocks
+        if self.taps == 2:
+            if bs >= 2:
+                z = mx.zeros((B, n_blk, 1, self.num_groups, self.group_size), dtype=blocks.dtype)
+                shifted = mx.concatenate([z, blocks[:, :, : bs - 1]], axis=2)
+                out = out + coeffs[:, :, :, 1] * shifted
+        else:
+            for tap in range(1, self.taps):
+                if tap >= bs:
+                    break
+                z = mx.zeros((B, n_blk, tap, self.num_groups, self.group_size), dtype=blocks.dtype)
+                shifted = mx.concatenate([z, blocks[:, :, : bs - tap]], axis=2)
+                out = out + coeffs[:, :, :, tap] * shifted
         return out.reshape(B, L, H)
 
-    def prepare(self, hidden_states: mx.array):
+    def prepare(self, hidden_states: mx.array, *, block_size: int | None = None):
         B, L, _ = hidden_states.shape
         coeffs = self.kernel_projection(hidden_states).reshape(
             B, L, 2, self.taps, self.num_groups
         )
-        prepared = self._convolve(hidden_states, coeffs[:, :, 0, :, :], side=0)
+        prepared = self._convolve(hidden_states, coeffs[:, :, 0, :, :], side=0, block_size=block_size)
         return prepared, coeffs[:, :, 1, :, :]
 
-    def finish(self, hidden_states: mx.array, delta1: mx.array) -> mx.array:
-        return self._convolve(hidden_states, delta1, side=1)
+    def finish(self, hidden_states: mx.array, delta1: mx.array, *, block_size: int | None = None) -> mx.array:
+        return self._convolve(hidden_states, delta1, side=1, block_size=block_size)
 
 
 class Qwen3DFlashAttention(nn.Module):
@@ -175,6 +188,39 @@ class Qwen3DFlash2DecoderLayer(nn.Module):
         h = self.mlp(h)
         h = self.mlp_conv.finish(h, mlp_k1)
         return residual + h
+
+
+_COMPILED_SEL_CACHE: dict[int, Any] = {}
+
+
+def _get_compiled_selector(top_k: int):
+    fn = _COMPILED_SEL_CACHE.get(top_k)
+    if fn is None:
+        @mx.compile
+        def _sel(logits, h_out, anchor_tok, pred_cb, succ_cb, hp_w):
+            idx = mx.argpartition(-logits, kth=top_k - 1, axis=-1)[..., :top_k]
+            vals = mx.take_along_axis(logits, idx, axis=-1)
+            order = mx.argsort(-vals, axis=-1)
+            cand_ids = mx.take_along_axis(idx, order, axis=-1)
+            u_f32 = mx.take_along_axis(vals, order, axis=-1).astype(mx.float32)
+
+            hp = (h_out @ hp_w.T).astype(mx.float32)
+            succ = succ_cb[cand_ids].astype(mx.float32)
+            pred_id = anchor_tok.reshape(1)
+            cols = []
+            K_pos = logits.shape[1]
+            for pos in range(K_pos):
+                pred_vec = pred_cb[pred_id].astype(mx.float32)
+                ctx = pred_vec * hp[:, pos, :]
+                trans = mx.sum(ctx[:, None, :] * succ[:, pos, :, :], axis=-1)
+                scores = u_f32[:, pos, :] + trans
+                sel = mx.argmax(scores, axis=-1, keepdims=True)
+                pred_id = mx.take_along_axis(cand_ids[:, pos, :], sel, axis=-1).squeeze(-1)
+                cols.append(pred_id)
+            return mx.stack(cols, axis=1).squeeze(0)
+
+        fn = _COMPILED_SEL_CACHE[top_k] = _sel
+    return fn
 
 
 class CandidateSelector(nn.Module):
@@ -370,6 +416,18 @@ class DFlash2DraftModel(nn.Module):
             return mx.argmax(logits, axis=-1).squeeze(0), None, None
 
         top_k = self.selector_top_k
+        if use_selector and not return_lattice:
+            cs = self.candidate_selector
+            draft_toks = _get_compiled_selector(top_k)(
+                logits,
+                h_out,
+                anchor_tok,
+                cs.predecessor_codebook,
+                cs.successor_codebook,
+                cs.hidden_projection.weight,
+            )
+            return draft_toks, None, None
+
         idx = mx.argpartition(-logits, kth=top_k - 1, axis=-1)[..., :top_k]
         vals = mx.take_along_axis(logits, idx, axis=-1)
         order = mx.argsort(-vals, axis=-1)

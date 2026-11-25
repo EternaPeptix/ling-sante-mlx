@@ -316,7 +316,7 @@ def _ml_cfg(B: int):
         return 1, B, 2
     if B <= 16:
         return 2, (B + 1) // 2, 2
-    return 3, (B + 2) // 3, 2
+    return 2, (B + 1) // 2, 1
 
 
 def mla_multilinear_rows(x: mx.array, w: mx.array, g_raw: mx.array | None = None) -> mx.array:
@@ -350,7 +350,7 @@ def mla_multilinear_rows(x: mx.array, w: mx.array, g_raw: mx.array | None = None
 
 
 def mla_multilinear_fp8_rows(
-    x: mx.array, w_fp8: mx.array, w_sc: mx.array, *, scale_by_n: bool, g_raw: mx.array | None = None
+    x: mx.array, w_fp8: mx.array, w_sc: mx.array, *, scale_by_n: bool, g_raw: mx.array | None = None, cfg=None
 ) -> mx.array:
     """Bit-exact FP8 MultiLinear reading uint8 weights + float32 scale_inv directly."""
     B, H, L, K = x.shape
@@ -358,7 +358,7 @@ def mla_multilinear_fp8_rows(
     assert L == 1 and 1 <= B <= 24 and w_fp8.shape == (H, N, K) and K % 128 == 0 and N % 8 == 0
     has_gate = g_raw is not None
     gr = g_raw if has_gate else mx.zeros((1,), dtype=x.dtype)
-    bsg, b_sub, tm = _ml_cfg(B)
+    bsg, b_sub, tm = _ml_cfg(B) if cfg is None else cfg
     nt = N // (4 * tm)
     (out,) = _ml_fp8_kernel()(
         inputs=[x, w_fp8, w_sc, gr],

@@ -65,3 +65,32 @@ See [docs/OPT_LOG.md](OPT_LOG.md) for the full multi-token kernel & speculative 
 * **Live server (`512S1:8080`, `mlx_lm.server --decode-concurrency 4 --prompt-concurrency 1`, `LINGSANTE_MTP=1`)**:
   * `bench/http_smoke.py --max-tokens 128`: `C=1`: `23.33–33.45 tok/s`; `C=4` concurrent: `423 tok in 6.45s` (**`65.58 agg tok/s`**), `exact_vs_C1=True`.
   * `bench/http_smoke.py --max-tokens 256`: `C=1`: `26.58–36.70 tok/s`; `C=4` concurrent: `517 tok in 8.73s` (**`59.22 agg tok/s`**), `exact_vs_C1=True`.
+
+---
+
+## Phase 2: EAGLE-3 Q4-Dense Drafter, Roofline Characterization & Production Integration (`512S1`)
+
+All numbers below are strictly **bit-exact greedy (`0` token diffs AND `0` logprob SHA-256 diffs over 32 steps vs `baseline.json`)**.
+
+* **Held-out bit-exact decode (`bench/eagle3_mtp_bench.py`, winning `e3v4` EAGLE-3 Q4-Dense + `FeatFuse` `[1,18,35,52,70]` + `dyn_step th=0.55`)**:
+  * **4-prompt median**: **`53.13 tok/s`** (`52.68 weighted`, `E_acc=3.060`, `L=3.84`, `cyc=58.09 ms`, vs stock `15.05 tok/s` — **`3.53x`** speedup; `@256` tokens: **`50.72 med / 51.78 weighted tok/s`**).
+* **Production `BatchGenerator` (`bench/batch_dec.py --C 1,2,3,4 --tokens 128 --reps 2 --mode batchgen`, `batchgen_eagle3_final.json`)**:
+  * **`C=1`** (`PROMPTS[0]`): **`50.47 tok/s`** (`55.39 ms/step`, `317.7 GB`), `exact_tok=True`, `exact_lp32=True` (vs Phase 1 `32.99`, stock `15.05`)
+  * **`C=2`**: **`75.86 agg tok/s`** (`37.93/stream`, `67.92 ms/step`, `317.7 GB`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=3`**: **`77.06 agg tok/s`** (`25.69/stream`, `99.39 ms/step`, `318.0 GB`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=4`**: **`84.13 agg tok/s`** (`21.03/stream`, `119.15 ms/step`, `319.2 GB`), `exact_tok=True`, `exact_lp32=True`
+  * `LINGSANTE_MTP=0`: `C=1 = 25.92 tok/s`, `C=4 = 64.43 tok/s`, `exact_tok=True`, `exact_lp32=True`; `LINGSANTE_EAGLE3=0`: `C=1 = 42.20 tok/s`, `exact_tok=True`, `exact_lp32=True`.
+* **Production `generate_step` (all 4 `bench/exact.py` prompts, `128` tok)**:
+  * **`51.88 median / 51.66 weighted tok/s`** (`medical_stemi: 48.77`, `chemistry_kmno4: 59.58`, `biology_lac: 54.99`, `medical_renal_pharm: 45.54`), all exact.
+* **M3 Ultra DRAM Roofline (`512S1`, 800 GB/s peak / ~650–680 GB/s sustained, `bench/profile_verify_c1.py`)**:
+  * `16.84 GB` fixed/cycle + `0.594 GB * mean_uniq_exp`; real `fast_verify_forward` `L=5` = `57.23 ms`, `L=8` = `70.32 ms`, Metal `bsg=2` spill cliff at `L=9` = `86.31 ms` (`L=16` = `120.95–121.25 ms`). KDA/MoE/head run at ~92–98% of sustained DRAM bandwidth; `80 tok/s` at `C=1` bit-exact would require `E_acc >= 5.0` at `L=5` (`>= 6.2` at `L=8`, `p1 >= 0.94`), exceeding the target model's native no-drift 1-layer MTP ceiling (`p1=0.862`, `E_acc_nodrift[8]=5.746`).
+* **Verification suite** (`server_exact_test`, `EDGE_CASES_PASS`, `run_eval`, and `http_smoke` run post-final `spec_engine.py` `C == 1` fix; kernel/context suites run prior to that 3-line `to_standard_cache` fix):
+  * `bench/rows_fp8_test.py`, `bench/rows_moe_test.py`, `bench/verify_kernels_test.py`: `SUMMARY: ALL PASS`; `kv_append`/`kv_append_varlen`/`step_rows(C=4)` parity checks `PASS`.
+  * `bench/server_exact_test.py` (`1 -> 4 -> 2 -> 3 -> 1`, 5 requests): `SUMMARY: ALL PASS` (`exact_tok=True`, `exact_lp=True`).
+  * `bench/ctx_exact_test.py --ctx 2048 --tokens 32 --mtp`: `SUMMARY: ALL PASS` (`exact_tok=True`, `exact_lp=True`).
+  * Edge-case suite (`max_tokens=1/2`, `generate_step` early break + continuation, `deepcopy` Turn-2 `M=1`/`M=3`, mixed `C=1` greedy + `temp=0.7` `_exit_spec_mode` `BatchKVCache` fix + `remove(return_prompt_caches=True)` + greedy re-entry, `StopSequences`): `EDGE_CASES_PASS`.
+  * `tools/run_eval.py gen`: **`47.5–60.0 tok/s`** across all 6 prompts (`313.4 GB` active mem); `tools/run_eval.py ppl`: `chunk 64 mean NLL 0.04473 (ppl 1.0458)`, `chunk 512 mean NLL 0.04646 (ppl 1.0476)`.
+* **Live server (`512S1:8080`, `mlx_lm.server --decode-concurrency 4 --prompt-concurrency 1`, `LINGSANTE_MTP=1`)**:
+  * `bench/http_smoke.py --base-url http://127.0.0.1:8080 --max-tokens 128`: `C=1`: `31.54–45.07 tok/s`; `C=4` concurrent: `423 tok in 5.84s` (**`72.46 agg tok/s`**), `exact_vs_C1=True`.
+  * `bench/http_smoke.py --base-url http://127.0.0.1:8080 --max-tokens 256`: `C=1`: `39.54–52.05 tok/s`; `C=4` concurrent: `517 tok in 7.43s` (**`69.60 agg tok/s`**), `exact_vs_C1=True`.
+  * Non-greedy `temperature=0.7` `/v1/chat/completions` sanity check: HTTP `200`, `24/25` cached prompt tokens, clean `server.log`.

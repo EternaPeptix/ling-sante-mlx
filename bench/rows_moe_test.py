@@ -11,9 +11,11 @@ from mlx_lm.models.bailing_moe_v3.rows.gemv import gemv_rows, gemv_swiglu_rows  
 from mlx_lm.models.bailing_moe_v3.rows.gather import gather_rows  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.moe import (  # noqa: E402
     moe_combine8_sh_res_rows,
+    moe_dedup_rows,
     moe_down_combine_rows,
     moe_gate_up_swiglu_rows,
 )
+from mlx_lm.models.bailing_moe_v3.rows.router import gate_rows  # noqa: E402
 
 from bench._layer_loader import bit_diff_count, load_layer, load_visits  # noqa: E402
 
@@ -123,6 +125,73 @@ def main():
                 got_m, sw.down_proj.weight, sw.down_proj.scales, inds, wts, shared=sh, residual=hp
             )
             ok &= check(f"L{L} B={B} coll down_combine+sh+res", got_full, ref_full)
+
+        # 3. High-B adaptive row-split test (B=5..24): realistic router + forced cnt=1,2,3,4,5,8,12,16
+        for B in (5, 8, 12, 16, 20, 24):
+            base = (mx.random.normal((1, 4096)) * 0.25).astype(mx.bfloat16)
+            xm = (base + (mx.random.normal((B, 4096)) * 0.12)).astype(mx.bfloat16)
+            hp = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+            sh = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+            gate = layer.mlp.gate
+            inds_real, wts = gate_rows(
+                xm, gate.weight, gate.expert_bias,
+                top_k=gate.top_k, n_group=gate.n_group, topk_group=gate.topk_group,
+                routed_scaling_factor=gate.routed_scaling_factor,
+            )
+            mx.eval(xm, hp, sh, inds_real, wts)
+            _, _, ref_m, _, ref_comb = stock_routed_b1(layer, xm, inds_real, wts)
+            ref_full = (ref_comb + sh) + hp
+            dd = moe_dedup_rows(inds_real)
+            got_m = moe_gate_up_swiglu_rows(
+                xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales,
+                inds_real, dedup=dd, adaptive=1,
+            )
+            ok &= check(f"L{L} B={B} real adapt gu", got_m, ref_m)
+            got_f = moe_down_combine_rows(
+                got_m, sw.down_proj.weight, sw.down_proj.scales, inds_real, wts,
+                shared=sh, residual=hp, dedup=dd,
+            )
+            ok &= check(f"L{L} B={B} real adapt dc", got_f, ref_full)
+
+        # Forced exact cnt=1,2,3,4,5,8,12,16 collisions across B=16 rows (all with adaptive=1 dedup & inline)
+        xm = (mx.random.normal((16, 4096)) * 0.25).astype(mx.bfloat16)
+        hp = (mx.random.normal((16, 4096)) * 0.25).astype(mx.bfloat16)
+        sh = (mx.random.normal((16, 4096)) * 0.25).astype(mx.bfloat16)
+        wts = mx.softmax(mx.random.normal((16, 8)), axis=-1) * 2.5
+        forced_rows = []
+        for b in range(16):
+            row = [100 + b * 8 + j for j in range(8)]
+            if b < 16:
+                row[0] = 10   # cnt=16
+            if b < 12:
+                row[1] = 20   # cnt=12
+            if b < 8:
+                row[2] = 30   # cnt=8
+            if b < 5:
+                row[3] = 40   # cnt=5
+            if b < 4:
+                row[4] = 50   # cnt=4
+            if b < 3:
+                row[5] = 60   # cnt=3
+            if b < 2:
+                row[6] = 70   # cnt=2 (row[7] gives cnt=1 experts!)
+            forced_rows.append(row)
+        inds_f = mx.array(forced_rows, dtype=mx.uint32)
+        mx.eval(xm, hp, sh, wts, inds_f)
+        _, _, ref_mf, _, ref_combf = stock_routed_b1(layer, xm, inds_f, wts)
+        ref_fullf = (ref_combf + sh) + hp
+        dd_f = moe_dedup_rows(inds_f)
+        for mode, dd_arg in (("dedup", dd_f), ("inline", None)):
+            gm = moe_gate_up_swiglu_rows(
+                xm, sw.gate_proj.weight, sw.gate_proj.scales, sw.up_proj.weight, sw.up_proj.scales,
+                inds_f, dedup=dd_arg, adaptive=1,
+            )
+            ok &= check(f"L{L} B=16 forced({mode}) adapt gu", gm, ref_mf)
+            gf = moe_down_combine_rows(
+                gm, sw.down_proj.weight, sw.down_proj.scales, inds_f, wts,
+                shared=sh, residual=hp, dedup=dd_arg,
+            )
+            ok &= check(f"L{L} B=16 forced({mode}) adapt dc", gf, ref_fullf)
 
     print("SUMMARY:", "ALL PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

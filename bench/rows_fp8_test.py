@@ -1,4 +1,6 @@
 """Bit-exactness verification and pipelined GB/s microbenchmark for FP8 linear/MultiLinear kernels."""
+import argparse
+import os
 import statistics
 import sys
 import time
@@ -19,6 +21,7 @@ from mlx_lm.models.bailing_moe_v3.rows.gemv import (  # noqa: E402
 from mlx_lm.models.bailing_moe_v3.rows.gemv_fp8 import (  # noqa: E402
     dequant_fp8_multilinear_to_bf16,
     dequant_fp8_to_bf16,
+    gemv_fp8_rows,
     gemv_fp8_rows_group,
     gemv_fp8_swiglu_rows,
     gemv_lin,
@@ -26,7 +29,7 @@ from mlx_lm.models.bailing_moe_v3.rows.gemv_fp8 import (  # noqa: E402
     gemv_lin_res,
     gemv_lin_swiglu,
 )
-from mlx_lm.models.bailing_moe_v3.rows.mla import mla_multilinear_lin, mla_multilinear_rows  # noqa: E402
+from mlx_lm.models.bailing_moe_v3.rows.mla import mla_multilinear_fp8_rows, mla_multilinear_lin, mla_multilinear_rows  # noqa: E402
 
 from bench._layer_loader import bit_diff_count, load_head, load_layer  # noqa: E402
 
@@ -252,7 +255,105 @@ def bench_and_tune(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head):
         print(f"    B={B:2d} shSw : {' '.join(sh_str)}", flush=True)
 
 
+def sweep_b(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head):
+    print("\n=== Sweep B in (8, 9, 10, 12, 16, 20, 24) for FP8, MLA MultiLinear, and BF16 lm_head ===", flush=True)
+    a4b, a4f = l4_bf.attention, l4_fp8.attention
+    a7b, a7f = l7_bf.attention, l7_fp8.attention
+    se_b, se_f = l4_bf.mlp.shared_experts, l4_fp8.mlp.shared_experts
+    m0b, m0f = l0_bf.mlp, l0_fp8.mlp
+    w_qkv_bf = [a4b.q_proj.weight, a4b.k_proj.weight, a4b.v_proj.weight, a4b.f_proj.weight, a4b.g_proj.weight]
+    w_qkv_f8 = [a4f.q_proj.weight_fp8, a4f.k_proj.weight_fp8, a4f.v_proj.weight_fp8, a4f.f_proj.weight_fp8, a4f.g_proj.weight_fp8]
+    s_qkv_f8 = [a4f.q_proj.weight_scale_inv, a4f.k_proj.weight_scale_inv, a4f.v_proj.weight_scale_inv, a4f.f_proj.weight_scale_inv, a4f.g_proj.weight_scale_inv]
+
+    # Synthetic (4096, 4096) FP8 matrix (exact 0-diff ref via dequant_fp8_to_bf16)
+    mx.random.seed(99)
+    w4096_u8 = mx.random.randint(0, 240, (4096, 4096), dtype=mx.uint8)
+    s4096 = mx.full((32, 32), 0.01, dtype=mx.float32)
+    w4096_bf = dequant_fp8_to_bf16(w4096_u8, s4096)
+    mx.eval(w4096_u8, s4096, w4096_bf)
+
+    ns_cands = [(1, 8, 1), (1, 4, 1), (1, 2, 1), (1, 8, 2), (1, 4, 2), (1, 2, 2), (2, 4, 2), (2, 2, 2), (2, 4, 1), (2, 2, 1)]
+    sw_cands = [(1, 4, 1), (1, 8, 1), (2, 4, 1), (2, 2, 1), (2, 4, 2)]
+    ml_cands = [(1, 1), (1, 2), (2, 2), (2, 1), (3, 2)]
+    lh_cands = [(8, 1, 2), (4, 1, 2), (8, 1, 1), (4, 1, 1), (4, 2, 2), (4, 2, 1), (4, 3, 2)]
+
+    for B in (8, 9, 10, 12, 16, 20, 24):
+        x4 = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+        x8 = (mx.random.normal((B, 8192)) * 0.25).astype(mx.bfloat16)
+        qn = (mx.random.normal((B, 64, 1, 128)) * 0.25).astype(mx.bfloat16)
+        ao = (mx.random.normal((B, 64, 1, 512)) * 0.25).astype(mx.bfloat16)
+        gr = (mx.random.normal((B, 64)) * 0.5).astype(mx.bfloat16)
+        mx.eval(x4, x8, qn, ao, gr)
+
+        ref_qkv = gemv_rows_multi(x4, w_qkv_bf)
+        ref_op = gemv_rows(x8, a4b.o_proj.weight)
+        ref_4096 = gemv_rows(x4, w4096_bf)
+        ref_sh = gemv_swiglu_rows(x4, se_b.gate_proj.weight, se_b.up_proj.weight)
+        ref_eq = mla_multilinear_rows(qn, a7b.embed_q.weight)
+        ref_uo = mla_multilinear_rows(ao, a7b.unembed_out.weight, g_raw=gr)
+        ref_lh = mx.concatenate([lm_head(x4[b : b + 1]) for b in range(B)], axis=0)
+        mx.eval(*ref_qkv, ref_op, ref_4096, ref_sh, ref_eq, ref_uo, ref_lh)
+
+        cands_b = ns_cands + ([(3, 2, 1), (3, 2, 2), (4, 2, 1)] if B >= 20 else [])
+        res_qkv, res_op, res_4096 = [], [], []
+        for bsg, bm_m, tm in cands_b:
+            cfg = (bsg, (B + bsg - 1) // bsg, bm_m, tm)
+            gq = gemv_fp8_rows_group([x4] * 5, w_qkv_f8, s_qkv_f8, cfg=cfg)
+            go = gemv_fp8_rows(x8, a4f.o_proj.weight_fp8, a4f.o_proj.weight_scale_inv, cfg=cfg)
+            g4 = gemv_fp8_rows(x4, w4096_u8, s4096, cfg=cfg)
+            assert all(bit_diff_count(a, b) == 0 for a, b in zip(gq, ref_qkv)), f"qkv diff B={B} {cfg}"
+            assert bit_diff_count(go, ref_op) == 0, f"op diff B={B} {cfg}"
+            assert bit_diff_count(g4, ref_4096) == 0, f"4096 diff B={B} {cfg}"
+            res_qkv.append((pipe_ms(lambda c=cfg: gemv_fp8_rows_group([x4] * 5, w_qkv_f8, s_qkv_f8, cfg=c)) * 1000, f"({bsg},{bm_m},{tm})"))
+            res_op.append((pipe_ms(lambda c=cfg: gemv_fp8_rows(x8, a4f.o_proj.weight_fp8, a4f.o_proj.weight_scale_inv, cfg=c)) * 1000, f"({bsg},{bm_m},{tm})"))
+            res_4096.append((pipe_ms(lambda c=cfg: gemv_fp8_rows(x4, w4096_u8, s4096, cfg=c)) * 1000, f"({bsg},{bm_m},{tm})"))
+
+        res_sh = []
+        cands_sw = [
+            c for c in (sw_cands + ([(3, 2, 1), (4, 2, 1)] if B >= 20 else []))
+            if ((B + c[0] - 1) // c[0]) * c[2] <= 12
+        ]
+        for bsg, bm_m, tm in cands_sw:
+            cfg = (bsg, (B + bsg - 1) // bsg, bm_m, tm)
+            gs = gemv_fp8_swiglu_rows(x4, se_f.gate_proj.weight_fp8, se_f.gate_proj.weight_scale_inv, se_f.up_proj.weight_fp8, se_f.up_proj.weight_scale_inv, cfg=cfg)
+            assert bit_diff_count(gs, ref_sh) == 0, f"sh diff B={B} {cfg}"
+            res_sh.append((pipe_ms(lambda c=cfg: gemv_fp8_swiglu_rows(x4, se_f.gate_proj.weight_fp8, se_f.gate_proj.weight_scale_inv, se_f.up_proj.weight_fp8, se_f.up_proj.weight_scale_inv, cfg=c)) * 1000, f"({bsg},{bm_m},{tm})"))
+
+        res_ml = []
+        for bsg, tm in ml_cands:
+            cfg = (bsg, (B + bsg - 1) // bsg, tm)
+            ge = mla_multilinear_fp8_rows(qn, a7f.embed_q.weight_fp8, a7f.embed_q.weight_scale_inv, scale_by_n=True, cfg=cfg)
+            gu = mla_multilinear_fp8_rows(ao, a7f.unembed_out.weight_fp8, a7f.unembed_out.weight_scale_inv, scale_by_n=False, g_raw=gr, cfg=cfg)
+            assert bit_diff_count(ge, ref_eq) == 0 and bit_diff_count(gu, ref_uo) == 0, f"ml diff B={B} {cfg}"
+            te = pipe_ms(lambda c=cfg: mla_multilinear_fp8_rows(qn, a7f.embed_q.weight_fp8, a7f.embed_q.weight_scale_inv, scale_by_n=True, cfg=c)) * 1000
+            tu = pipe_ms(lambda c=cfg: mla_multilinear_fp8_rows(ao, a7f.unembed_out.weight_fp8, a7f.unembed_out.weight_scale_inv, scale_by_n=False, g_raw=gr, cfg=c)) * 1000
+            res_ml.append((te + tu, f"({bsg},{tm})={te:.0f}+{tu:.0f}"))
+
+        res_lh = []
+        for bm, bsg, tm in lh_cands:
+            cfg = (bm, 1, 1, 32, tm, 4, bsg)
+            gl = gemv_rows(x4, lm_head.weight, cfg=cfg)
+            assert bit_diff_count(gl, ref_lh) == 0, f"lh diff B={B} {cfg}"
+            tl = pipe_ms(lambda c=cfg: gemv_rows(x4, lm_head.weight, cfg=c)) * 1000
+            res_lh.append((tl, f"(bm={bm},bsg={bsg},tm={tm})={tl:.0f}us"))
+
+        for r in (res_qkv, res_op, res_4096, res_sh, res_ml, res_lh):
+            r.sort()
+        print(f"  B={B:2d}:", flush=True)
+        print(f"    qkv5(8192,4096) : " + " ".join(f"{lb}={t:.0f}us" for t, lb in res_qkv[:4]), flush=True)
+        print(f"    op  (4096,8192) : " + " ".join(f"{lb}={t:.0f}us" for t, lb in res_op[:4]), flush=True)
+        print(f"    w4k (4096,4096) : " + " ".join(f"{lb}={t:.0f}us" for t, lb in res_4096[:4]), flush=True)
+        print(f"    shSw(1280,4096) : " + " ".join(f"{lb}={t:.0f}us" for t, lb in res_sh[:4]), flush=True)
+        print(f"    mla_fp8(eq+uo)  : " + " ".join(f"{lb}" for _, lb in res_ml[:4]), flush=True)
+        print(f"    lm_head(bf16)   : " + " ".join(f"{lb}" for _, lb in res_lh[:4]), flush=True)
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sweep-b", action="store_true")
+    ap.add_argument("--skip-exact", action="store_true")
+    a = ap.parse_args()
+
     l0_bf, _ = load_layer(0, use_fp8=False)
     l4_bf, _ = load_layer(4, use_fp8=False)
     l7_bf, _ = load_layer(7, use_fp8=False)
@@ -261,9 +362,14 @@ def main():
     l7_fp8, _ = load_layer(7, use_fp8=True)
     _, lm_head, _ = load_head()
 
+    if a.sweep_b:
+        sweep_b(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head)
+        return 0
+
     ok = True
-    ok &= test_weights_and_prefill(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8)
-    ok &= test_gemv_exactness(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head)
+    if not a.skip_exact:
+        ok &= test_weights_and_prefill(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8)
+        ok &= test_gemv_exactness(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head)
     if ok:
         bench_and_tune(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head)
     print("\nSUMMARY:", "ALL PASS" if ok else "FAIL", flush=True)

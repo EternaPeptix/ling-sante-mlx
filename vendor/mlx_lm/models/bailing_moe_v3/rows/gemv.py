@@ -248,7 +248,7 @@ def _cfg(N: int, K: int, B: int = 1, is_swiglu: bool = False):
             tm = 2
         elif B >= 13:
             if bn == 1 and sm == 1 and sn == 32:
-                bsg = 2 if B <= 16 else 3
+                bsg = 2
                 tm = 2
             else:
                 tm = 1
@@ -335,7 +335,7 @@ def _build_group(out_dt, w_dt, x_dt, B, G, Ns, K, cfg, has_res=False, is_swiglu=
     return _KERNELS[key]
 
 
-def gemv_rows_group(xs, ws):
+def gemv_rows_group(xs, ws, *, cfg=None):
     """Independent problems out_i = xs[i] @ ws[i].T; xs[i] (B, K), ws[i] (N_i, K) same dtype & K."""
     xs, ws = list(xs), list(ws)
     B, K = xs[0].shape
@@ -343,15 +343,16 @@ def gemv_rows_group(xs, ws):
     assert 1 <= B <= MAX_B
     assert all(x.shape == (B, K) and x.dtype == dt for x in xs)
     assert all(w.ndim == 2 and w.shape[1] == K and w.dtype == dt for w in ws)
-    cfgs = [_cfg(w.shape[0], K, B, False) for w in ws]
-    if len(set(cfgs)) > 1:
-        out = [None] * len(ws)
-        for c in dict.fromkeys(cfgs):
-            idx = [i for i, cc in enumerate(cfgs) if cc == c]
-            for i, o in zip(idx, gemv_rows_group([xs[i] for i in idx], [ws[i] for i in idx])):
-                out[i] = o
-        return out
-    cfg = cfgs[0]
+    if cfg is None:
+        cfgs = [_cfg(w.shape[0], K, B, False) for w in ws]
+        if len(set(cfgs)) > 1:
+            out = [None] * len(ws)
+            for c in dict.fromkeys(cfgs):
+                idx = [i for i, cc in enumerate(cfgs) if cc == c]
+                for i, o in zip(idx, gemv_rows_group([xs[i] for i in idx], [ws[i] for i in idx], cfg=c)):
+                    out[i] = o
+            return out
+        cfg = cfgs[0]
     Ns = [w.shape[0] for w in ws]
     G = len(ws)
     kern, ntg = _build_group(dt, dt, dt, B, G, Ns, K, cfg)
@@ -368,8 +369,8 @@ def gemv_rows_group(xs, ws):
     )
 
 
-def gemv_rows(x, w):
-    return gemv_rows_group([x], [w])[0]
+def gemv_rows(x, w, *, cfg=None):
+    return gemv_rows_group([x], [w], cfg=cfg)[0]
 
 
 def gemv_rows_multi(x, ws):

@@ -196,3 +196,52 @@ Wired native MTP cleanly into `vendor/mlx_lm` (`LINGSANTE_MTP=1` default-on when
   * `bench/http_smoke.py --max-tokens 128`: `C=1`: `23.33–33.45 tok/s` (`72–128` tok); `C=4` concurrent: `423 tok in 6.45s` (**`65.58 agg tok/s`** end-to-end incl. HTTP/prefill/staggered finishes, up from `38.00`), **`exact_vs_C1=True`**.
   * `bench/http_smoke.py --max-tokens 256`: `C=1`: `26.58–36.70 tok/s` (`72–217` tok); `C=4` concurrent: `517 tok in 8.73s` (**`59.22 agg tok/s`** incl. natural EOS stagger `72..217` tok), **`exact_vs_C1=True`**.
   * Non-greedy `temperature=0.7` `/v1/chat/completions` HTTP sanity check: HTTP `200`, clean `Prompt Cache` reuse in `server.log`.
+
+---
+
+## Phase 2: M3 Ultra Roofline Analysis, EAGLE-3 Q4-Dense Drafter & Production Integration (`512S1`)
+
+### Empirically Measured M3 Ultra DRAM Roofline & Hardware Limits (`bench/profile_verify_c1.py`)
+- **Fixed bytes per verify cycle (`512S1`, 800 GB/s peak / ~650–680 GB/s sustained)**: `16.84 GB` fixed (`63` KDA layers = `12.68 GB FP8 + 0.50 GB` state, `9` MLA layers = `0.95 GB`, `71` shared MLPs = `1.42 GB`, BF16 `lm_head` = `1.29 GB`) + `0.594 GB * mean_uniq_exp`.
+- **Real end-to-end `fast_verify_forward` verify latencies (`C=1`)**:
+  * `L=1`: `39.09 ms`; `L=3`: `48.94 ms`; `L=5`: `57.23 ms` (`uniq=23.0`: `KDA_gemv=18.77 ms`, `KDA_pre_gdn=2.80 ms`, `MLA=2.83 ms` pipelined / `6.04 ms` sync, `rtr+sh=2.81 ms`, `MoE=24.13 ms`, `head=2.05 ms`); `L=8`: `70.32 ms` (`uniq=29.3`: `KDA_gemv=20.56 ms`, `MoE=30.47 ms`).
+  * **Hard Metal `bsg=2` register-spill cliff at `L >= 9`**: `L=9` jumps to `86.31 ms` (`L=10`: `88.23–90.05 ms`, `L=12`: `99.55 ms`, `L=16`: `120.95–121.25 ms`). Same effect confirmed on `rows/gemv_fp8.py` at `B=9` (`bsg=1, tm=2` spills to `76.86 ms` vs `bsg=1, tm=1` `28.79 ms` vs default `29.59 ms` KDA `*63`, `bit_diffs=0`).
+  * **Roofline gap to `80 tok/s` at `C=1` (bit-exact)**: KDA, MoE, and `lm_head` already sustain ~92–98% of physical DRAM bandwidth. Reaching `80 tok/s` at `C=1` bit-exact would require `E_acc >= 5.0` at `L=5` or `>= 6.2` at `L=8` (`p1 >= 0.94`), above the target model's native no-drift 1-layer MTP ceiling (`p1=0.862`, `E_acc_nodrift[8]=5.746`).
+
+### Abandoned / Negative Experiments
+- **`DFlash2` 5-layer block drafter**: plateaued below `< 50 tok/s` end-to-end.
+- **Standalone distilled `Ling-3.0-tiny` drafter**: `p1=0.726`, `E8=4.28`, capped at `<= 60.6 tok/s` even under Q4D estimates.
+- **`COOP=1` threadgroup FP8 GEMV**: `-2.3..7.8 ms` slower on `qkvfg` projections than `rows/gemv_fp8.py`.
+- **`moe_dc` tile-M sweeps (`tm=4/8`)**: optimal remains `tm=2, nsg=4, hdq=1`.
+- **`Beam-W2` verification trees**: `-5.14` to `-5.92 tok/s` slower than linear `DynStop` (`Probe` `e3v2/v3/v4` all negative vs `DynStop`).
+- **Blind 4-gram `SuffixMatcher`**: `-1.5 tok/s` net regression due to wrong speculative drafts inflating `mean_uniq_exp`.
+
+### Phase 2B: EAGLE-3 Disjoint Dataset, Training & Held-Out Selection (`e3v4`)
+- **600-prompt disjoint rollout corpus (`tools/gen_eagle3_data.py`, `~/science/data/lingsante_eagle3_600/`)**: `med=140, chem=80, bio=80, math=100, code=120, tech=80`, verified `0` prompt and `0` 6-gram overlaps vs `bench/exact.py` and `tools/run_eval.py`; `total_gen_tok=153,552` (`mean_gen=255.9`), `GLOBAL ALIGNMENT SELF-TEST: top1=149509/153552 (97.367%), top4=153529/153552 (99.985%)`; combined with `200` prior sequences (`800` total).
+- **Training & Probe Comparison (`bench/probe_mtp_eagle.py`, Q4-Dense drafter + val `DynStop` sweep)**:
+  * `e3v3` (`FeedbackBridgeV2`, `29.52M` trainable, `Ep 1 [BEST*]`: `L=1.2585`, `kl1=0.2948`, `p1=0.880`, `E2/4/6/8=2.580/3.500/3.830/3.950`, `dyn=59.18`): Q4D `B=1/2/4 = 1.448/1.550/1.882 ms`, val `DynStop` `58.72 q4d tok/s`, held-out `K=4` `51.99 med` / `dyn_step(0.55)` `51.15 med tok/s`.
+  * **`e3v4` (Winner, installed in `~/science/models/lingsante-mlx-mxfp4-bf16/eagle3-mtp/`)**: `FeedbackBridge` (`rank=1024`) + `FeatFuse` on layers `[1,18,35,52,70]`, `3` epochs (`grad_accum=8`, `max_lr=1.0e-4`, `depth_weights=1.5,1.2,1.0,0.9,0.8,0.7`); `Ep 3 [BEST*]`: `L=0.9223`, `kl1=0.2796`, `p1=0.880`, `E2/4/6/8=2.600/3.540/3.940/4.110 (med=3.511/4.156)`, `cos1=0.6113`, `dyn=61.14`. Q4D `B=1/2/4 = 1.401/1.460/1.822 ms`, val `DynStop` (`p1_min=0.00, th=0.55, K_cap=7`): `mean_L=4.35, E_acc=3.610, 60.98 q4d tok/s`.
+  * **Held-out bit-exact benchmark (`bench/eagle3_mtp_bench.py`, all `td=0, ld=0`)**: **`e3v4` (`dyn_step, th=0.55`) achieved `53.13 med tok/s` (`52.68 weighted tok/s`, `E_acc=3.060, L=3.84, cyc=58.09 ms`, `alphas=[0.841, 0.769, 0.604, 0.62, 0.478, 0.556, 0.5]`)** (`@256`: `50.72 med / 51.78 weighted tok/s`, `phase_ms={'draft': 4.55, 'verify': 53.59, 'commit': 1.11, 'refresh': 0.50}`) vs `e3v2 @th=0.60` (`50.35 med / 52.55 w`, `@256 49.64 / 51.44`) and stock `K=2` (`46.25 med / 46.29 w`).
+
+### Phase 2C: Production Integration & Final Verification (`512S1`, all `0` bit diffs vs `baseline.json`)
+- **Production changes (`vendor/mlx_lm/models/bailing_moe_v3/{mtp.py, spec_engine.py}`, `vendor/mlx_lm/generate.py`)**:
+  * Default-on EAGLE-3 Q4-Dense drafter (`FeatFuse` + `FeedbackBridge`/`FeedbackBridgeV2` + `kv_append` / `kv_append_varlen` + `C=1` `dyn_step` policy + `C>=2` `K=2` + `PromptProcessingBatch` `mtp_target_prefill_hidden`).
+  * Fixed `mtp_vcache_to_standard()` in `spec_engine.py` for `C == 1` to merge single-stream caches into `BatchKVCache` via `type(per[0][li]).merge(...)` rather than returning bare `KVCache`, preventing `AttributeError: 'KVCache' object has no attribute 'extend'` when a non-greedy request joins a single active greedy stream (`_exit_spec_mode()` + `GenerationBatch.extend()`).
+- **Kernel & op parity**: `kv_append` vs `prefill` `PASS (dk=0.0, dv=0.0)`, `kv_append_varlen` vs `prefill` `PASS (dk=0.0, dv=0.0)`, `step_rows(C=4)` vs `4x C=1` `PASS (max_diff=4.69e-02, argmax 4/4 match)`, `bench/rows_fp8_test.py`, `bench/rows_moe_test.py`, and `bench/verify_kernels_test.py`: all `SUMMARY: ALL PASS`.
+- **`bench/batch_dec.py --C 1,2,3,4 --tokens 128 --reps 2 --mode batchgen` (`~/science/runs/batchgen_eagle3_final.json`)**:
+  * **`C=1`** (`PROMPTS[0]`): **`50.47 tok/s`** (`55.39 ms/step`, `317.7 GB`), `exact_tok=True`, `exact_lp32=True` (vs Phase 1 `32.99`, stock `15.05`)
+  * **`C=2`**: **`75.86 agg tok/s`** (`37.93/stream`, `67.92 ms/step`, `317.7 GB`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=3`**: **`77.06 agg tok/s`** (`25.69/stream`, `99.39 ms/step`, `318.0 GB`), `exact_tok=True`, `exact_lp32=True`
+  * **`C=4`**: **`84.13 agg tok/s`** (`21.03/stream`, `119.15 ms/step`, `319.2 GB`), `exact_tok=True`, `exact_lp32=True`
+  * Fallbacks: `LINGSANTE_MTP=0`: `C=1: 25.92 tok/s`, `C=4: 64.43 tok/s`, `exact_tok=True`, `exact_lp32=True`; `LINGSANTE_EAGLE3=0`: `C=1: 42.20 tok/s`, `exact_tok=True`, `exact_lp32=True`.
+- **`generate_step` 4-prompt held-out `bench/exact.py` (`128` tok)**: **`median=51.88 / weighted=51.66 tok/s`** (`medical_stemi: 48.77`, `chemistry_kmno4: 59.58`, `biology_lac: 54.99`, `medical_renal_pharm: 45.54`, ALL exact vs `baseline.json`).
+- **`bench/ctx_exact_test.py --ctx 2048 --tokens 32 --mtp`**: `SUMMARY: ALL PASS` (`fastdecode C=1/4 = 21.35/56.68 agg tok/s`, `mtp generate_step C=1 = 4.83 e2e`, `mtp BatchGenerator C=1/4 = 4.80/4.78 e2e`).
+- **Post-final-edit verification (`spec_engine.py` `C == 1` fix)**:
+  * `bench/server_exact_test.py` (`1 -> 4 -> 2 -> 3 -> 1`, 5 requests): `SUMMARY: ALL PASS` (`exact_tok=True`, `exact_lp=True`).
+  * Edge-case suite (`EDGE_CASES_PASS`): `[1] max_tokens=1/2`, `[2] generate_step early-break + continuation`, `[3] BatchGenerator deepcopy Turn-2 M=1 (on-path vs baseline & off-path MTP vs non-MTP) & M=3`, `[4] mixed C=1 greedy + temp=0.7 _exit_spec_mode + remove(return_prompt_caches=True) + greedy re-entry + StopSequences`.
+  * `tools/run_eval.py gen`: all 6 medical/chemistry/biology prompts fluent at **`47.5–60.0 tok/s`** (`313.4 GB` active mem).
+  * `tools/run_eval.py ppl`: `chunk 64 mean NLL 0.04473 (ppl 1.0458)`, `chunk 512 mean NLL 0.04646 (ppl 1.0476)`, `ratio 0.99828`.
+- **Live HTTP `mlx_lm.server` (`512S1:8080`, `LINGSANTE_MTP=1`, `--decode-concurrency 4 --prompt-concurrency 1`)**:
+  * `bench/http_smoke.py --base-url http://127.0.0.1:8080 --max-tokens 128`: `C=1`: `31.54–45.07 tok/s` (`72–128` tok); `C=4` concurrent: `423 tok in 5.84s` (**`72.46 agg tok/s`** incl. HTTP/prefill/EOS stagger), **`exact_vs_C1=True`**.
+  * `bench/http_smoke.py --base-url http://127.0.0.1:8080 --max-tokens 256`: `C=1`: `39.54–52.05 tok/s` (`72–217` tok); `C=4` concurrent: `517 tok in 7.43s` (**`69.60 agg tok/s`**), **`exact_vs_C1=True`**.
+  * Non-greedy `temperature=0.7` `/v1/chat/completions` sanity check: HTTP `200`, `24/25` cached prompt tokens, clean `server.log`.

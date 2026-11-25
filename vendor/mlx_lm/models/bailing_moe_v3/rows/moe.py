@@ -15,10 +15,145 @@ import mlx.core as mx
 from .gather import mlx_header
 from .glue import GLUE_HEADER
 
-HEADER = mlx_header() + GLUE_HEADER
+_U32_DEQUANT = r"""
+template <int bits, int values_per_thread>
+inline void dequant_vals_u32(const thread uint32_t* w, thread float* d) {
+  if constexpr (bits == 4) {
+#pragma unroll
+    for (int p = 0; p < (values_per_thread / 8); p++) {
+      const uint32_t pk = w[p];
+      d[8 * p + 0] = Dequantize<4>{}(uint8_t(pk));
+      d[8 * p + 1] = Dequantize<4>{}(uint8_t(pk >> 4));
+      d[8 * p + 2] = Dequantize<4>{}(uint8_t(pk >> 8));
+      d[8 * p + 3] = Dequantize<4>{}(uint8_t(pk >> 12));
+      d[8 * p + 4] = Dequantize<4>{}(uint8_t(pk >> 16));
+      d[8 * p + 5] = Dequantize<4>{}(uint8_t(pk >> 20));
+      d[8 * p + 6] = Dequantize<4>{}(uint8_t(pk >> 24));
+      d[8 * p + 7] = Dequantize<4>{}(uint8_t(pk >> 28));
+    }
+  } else {
+#pragma unroll
+    for (int p = 0; p < (values_per_thread / 4); p++) {
+      const uint32_t pk = w[p];
+      d[4 * p + 0] = Dequantize<8>{}(uint8_t(pk));
+      d[4 * p + 1] = Dequantize<8>{}(uint8_t(pk >> 8));
+      d[4 * p + 2] = Dequantize<8>{}(uint8_t(pk >> 16));
+      d[4 * p + 3] = Dequantize<8>{}(uint8_t(pk >> 24));
+    }
+  }
+}
+
+template <typename T, typename U, int BITS, int GS, bool FAST, int R_TILE, int T_TILE, bool WRITE_SWIGLU>
+inline void moe_gu_pass_tile(
+    const device uint8_t* w0,
+    const device uint8_t* s0,
+    const device T* x,
+    thread const int* xo,
+    thread const int* pqs,
+    const int n_tok,
+    const int r0,
+    const int out_row,
+    const int NN,
+    const int KK,
+    const int in_w,
+    const int in_g,
+    const uint lane,
+    thread T g_bf[T_TILE][R_TILE],
+    device T* out) {
+  constexpr int PF = 32 / BITS;
+  constexpr int PPT = FAST ? 2 : 1;
+  constexpr int VPT = PF * PPT;
+  constexpr int BLOCK = VPT * 32;
+  constexpr int KEND_SUB = FAST ? 0 : BLOCK;
+
+  thread U res[T_TILE][R_TILE];
+#pragma unroll
+  for (int t = 0; t < T_TILE; t++)
+#pragma unroll
+    for (int r = 0; r < R_TILE; r++) res[t][r] = 0;
+
+  const device uint8_t* wp = w0 + (long)r0 * in_w;
+  const device uint8_t* sp = s0 + (long)r0 * in_g;
+  int k = 0;
+  for (; k < KK - KEND_SUB; k += BLOCK) {
+    if constexpr (T_TILE == 1) {
+      thread U xt[VPT];
+      load_vector<T, U, VPT>(x + xo[0] + k, xt);
+#pragma unroll
+      for (int r = 0; r < R_TILE; r++) {
+        const int rr = (out_row + r0 + r < NN) ? r : 0;
+        const device uint32_t* wptr = (const device uint32_t*)(wp + rr * in_w);
+        thread uint32_t rw[PPT];
+#pragma unroll
+        for (int p = 0; p < PPT; p++) rw[p] = wptr[p];
+        U sv = dequantize_scale<U, GS>((sp + rr * in_g)[0]);
+        thread U d[VPT];
+        dequant_vals_u32<BITS, VPT>(rw, d);
+        res[0][r] += dot_vals<BITS, VPT>(xt, d, sv);
+      }
+    } else {
+#pragma unroll
+      for (int r = 0; r < R_TILE; r++) {
+        const int rr = (out_row + r0 + r < NN) ? r : 0;
+        const device uint32_t* wptr = (const device uint32_t*)(wp + rr * in_w);
+        thread uint32_t rw[PPT];
+#pragma unroll
+        for (int p = 0; p < PPT; p++) rw[p] = wptr[p];
+        U sv = dequantize_scale<U, GS>((sp + rr * in_g)[0]);
+        thread U d[VPT];
+        dequant_vals_u32<BITS, VPT>(rw, d);
+#pragma unroll
+        for (int t = 0; t < T_TILE; t++) {
+          if (t < n_tok) {
+            thread U xt[VPT];
+            load_vector<T, U, VPT>(x + xo[t] + k, xt);
+            res[t][r] += dot_vals<BITS, VPT>(xt, d, sv);
+          }
+        }
+      }
+    }
+    wp += BLOCK * 4 / PF;
+    sp += BLOCK / GS;
+  }
+  if constexpr (!FAST) {
+    const int rem = clamp((int)(KK - k - int(lane) * VPT), 0, VPT);
+    if (rem > 0) {
+      for (int t = 0; t < T_TILE; t++) {
+        if (t < n_tok) {
+          thread U xt[VPT];
+          load_vector_safe<T, U, VPT>(x + xo[t] + k, xt, rem);
+          for (int r = 0; r < R_TILE; r++) {
+            if (out_row + r0 + r < NN) {
+              res[t][r] += qdot_safe<U, VPT, BITS>(
+                  wp + r * in_w, xt, dequantize_scale<U, GS>((sp + r * in_g)[0]), rem);
+            }
+          }
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < T_TILE; t++) {
+#pragma unroll
+    for (int r = 0; r < R_TILE; r++) {
+      U v = simd_sum(res[t][r]);
+      if (lane == 0 && t < n_tok && (out_row + r0 + r) < NN) {
+        if constexpr (WRITE_SWIGLU) {
+          out[pqs[t] * NN + out_row + r0 + r] = glue_swiglu_bf16(g_bf[t][r], static_cast<T>(v));
+        } else {
+          g_bf[t][r] = static_cast<T>(v);
+        }
+      }
+    }
+  }
+}
+"""
+
+HEADER = mlx_header() + GLUE_HEADER + _U32_DEQUANT
 _KERNELS = {}
 _GU_TMAX_CAP = int(os.environ.get("LINGSANTE_MOE_GU_TMAX_CAP", os.environ.get("LINGSANTE_MOE_TMAX_CAP", "4")))
 _DC_TMAX_CAP = int(os.environ.get("LINGSANTE_MOE_DC_TMAX_CAP", os.environ.get("LINGSANTE_MOE_TMAX_CAP", "1")))
+_GU_ADAPTIVE_MIN_B = int(os.environ.get("LINGSANTE_MOE_GU_ADAPTIVE_MIN_B", "5"))
 _ZERO_BF16 = mx.zeros((1,), dtype=mx.bfloat16)
 
 
@@ -108,7 +243,6 @@ _GU_PRE_INLINE = r"""
     constexpr int VPT = PF * PPT;      // 16
     constexpr int BLOCK = VPT * 32;    // 512
     constexpr int SSTEP = GS / VPT;    // 2
-    constexpr int ROWS = 4;
     typedef float U;
     typedef bfloat16_t T;
 
@@ -151,7 +285,6 @@ _GU_PRE_DEDUP = r"""
     constexpr int VPT = PF * PPT;      // 16
     constexpr int BLOCK = VPT * 32;    // 512
     constexpr int SSTEP = GS / VPT;    // 2
-    constexpr int ROWS = 4;
     typedef float U;
     typedef bfloat16_t T;
 
@@ -181,6 +314,62 @@ def _gu_src(use_dedup: bool) -> str:
     const device uint8_t* wu0 = (const device uint8_t*)wu + (long)e * NN * in_w + (long)out_row * in_w + lane * PPT * 4;
     const device uint8_t* su0 = scu + (long)e * NN * in_g + (long)out_row * in_g + lane / SSTEP;
 
+    if constexpr (ADAPTIVE && ROWS == 4) {
+      if (cnt == 1) {
+        const int tb = 0;
+        const int t = 0;
+        const int pq0 = __PQ_EXPR__;
+        int pqs[1] = { pq0 };
+        int xo[1] = { (pq0 / 8) * KK + int(lane) * VPT };
+        T g_bf[1][4];
+        moe_gu_pass_tile<T, U, BITS, GS, FAST, 4, 1, false>(wg0, sg0, x, xo, pqs, 1, 0, out_row, NN, KK, in_w, in_g, lane, g_bf, out);
+        moe_gu_pass_tile<T, U, BITS, GS, FAST, 4, 1, true>(wu0, su0, x, xo, pqs, 1, 0, out_row, NN, KK, in_w, in_g, lane, g_bf, out);
+      } else if (cnt == 2) {
+        const int tb = 0;
+        int xo[2], pqs[2];
+        for (int t = 0; t < 2; t++) {
+          int pq = __PQ_EXPR__;
+          pqs[t] = pq;
+          xo[t] = (pq / 8) * KK + int(lane) * VPT;
+        }
+        T g_bf[2][4];
+        moe_gu_pass_tile<T, U, BITS, GS, FAST, 4, 2, false>(wg0, sg0, x, xo, pqs, 2, 0, out_row, NN, KK, in_w, in_g, lane, g_bf, out);
+        moe_gu_pass_tile<T, U, BITS, GS, FAST, 4, 2, true>(wu0, su0, x, xo, pqs, 2, 0, out_row, NN, KK, in_w, in_g, lane, g_bf, out);
+      } else if (cnt >= 3 && cnt <= 4) {
+        const int tb = 0;
+        int xo[4], pqs[4];
+        for (int t = 0; t < 4; t++) {
+          int pq = __PQ_EXPR__;
+          pqs[t] = pq;
+          xo[t] = (pq / 8) * KK + int(lane) * VPT;
+        }
+        for (int rh = 0; rh < 2; rh++) {
+          const int r0 = rh * 2;
+          if (out_row + r0 >= NN) continue;
+          T g_bf[4][2];
+          moe_gu_pass_tile<T, U, BITS, GS, FAST, 2, 4, false>(wg0, sg0, x, xo, pqs, cnt, r0, out_row, NN, KK, in_w, in_g, lane, g_bf, out);
+          moe_gu_pass_tile<T, U, BITS, GS, FAST, 2, 4, true>(wu0, su0, x, xo, pqs, cnt, r0, out_row, NN, KK, in_w, in_g, lane, g_bf, out);
+        }
+      } else if (cnt >= 5) {
+        for (int r = 0; r < 4; r++) {
+          if (out_row + r >= NN) continue;
+          for (int tb = 0; tb < cnt; tb += 8) {
+            const int n_tok = min(8, cnt - tb);
+            int xo[8], pqs[8];
+            for (int t = 0; t < 8; t++) {
+              int pq = __PQ_EXPR__;
+              pqs[t] = pq;
+              xo[t] = (pq / 8) * KK + int(lane) * VPT;
+            }
+            T g_bf[8][1];
+            moe_gu_pass_tile<T, U, BITS, GS, FAST, 1, 8, false>(wg0, sg0, x, xo, pqs, n_tok, r, out_row, NN, KK, in_w, in_g, lane, g_bf, out);
+            moe_gu_pass_tile<T, U, BITS, GS, FAST, 1, 8, true>(wu0, su0, x, xo, pqs, n_tok, r, out_row, NN, KK, in_w, in_g, lane, g_bf, out);
+          }
+        }
+      }
+      return;
+    }
+
     for (int tb = 0; tb < cnt; tb += TMAX) {
         int xo[TMAX];
         int pqs[TMAX];
@@ -204,25 +393,48 @@ def _gu_src(use_dedup: bool) -> str:
             const device uint8_t* sp = sg0;
             int k = 0;
             for (; k < KK - KEND_SUB; k += BLOCK) {
-                thread uint32_t rw[ROWS][PPT];
-                U sv[ROWS];
+                if constexpr (HOIST_DQ) {
 #pragma unroll
-                for (int r = 0; r < ROWS; r++) {
-                    const device uint32_t* wptr = (const device uint32_t*)(wp + r * in_w);
+                    for (int r = 0; r < ROWS; r++) {
+                        const int rr = (out_row + r < NN) ? r : 0;
+                        const device uint32_t* wptr = (const device uint32_t*)(wp + rr * in_w);
+                        thread uint32_t rw[PPT];
 #pragma unroll
-                    for (int p = 0; p < PPT; p++) rw[r][p] = wptr[p];
-                    sv[r] = dequantize_scale<U, GS>((sp + r * in_g)[0]);
-                }
+                        for (int p = 0; p < PPT; p++) rw[p] = wptr[p];
+                        U sv = dequantize_scale<U, GS>((sp + rr * in_g)[0]);
+                        thread U d[VPT];
+                        dequant_vals_u32<BITS, VPT>(rw, d);
 #pragma unroll
-                for (int t = 0; t < TMAX; t++) {
-                    if (tb + t < cnt) {
-                        thread U xt[VPT];
-                        load_vector<T, U, VPT>(x + xo[t] + k, xt);
+                        for (int t = 0; t < TMAX; t++) {
+                            if (tb + t < cnt) {
+                                thread U xt[VPT];
+                                load_vector<T, U, VPT>(x + xo[t] + k, xt);
+                                res[t][r] += dot_vals<BITS, VPT>(xt, d, sv);
+                            }
+                        }
+                    }
+                } else {
+                    thread uint32_t rw[ROWS][PPT];
+                    U sv[ROWS];
 #pragma unroll
-                        for (int r = 0; r < ROWS; r++) {
-                            thread U d[VPT];
-                            dequant_vals<BITS, VPT>(rw[r], d);
-                            res[t][r] += dot_vals<BITS, VPT>(xt, d, sv[r]);
+                    for (int r = 0; r < ROWS; r++) {
+                        const int rr = (out_row + r < NN) ? r : 0;
+                        const device uint32_t* wptr = (const device uint32_t*)(wp + rr * in_w);
+#pragma unroll
+                        for (int p = 0; p < PPT; p++) rw[r][p] = wptr[p];
+                        sv[r] = dequantize_scale<U, GS>((sp + rr * in_g)[0]);
+                    }
+#pragma unroll
+                    for (int t = 0; t < TMAX; t++) {
+                        if (tb + t < cnt) {
+                            thread U xt[VPT];
+                            load_vector<T, U, VPT>(x + xo[t] + k, xt);
+#pragma unroll
+                            for (int r = 0; r < ROWS; r++) {
+                                thread U d[VPT];
+                                dequant_vals_u32<BITS, VPT>(rw[r], d);
+                                res[t][r] += dot_vals<BITS, VPT>(xt, d, sv[r]);
+                            }
                         }
                     }
                 }
@@ -237,7 +449,9 @@ def _gu_src(use_dedup: bool) -> str:
                             thread U xt[VPT];
                             load_vector_safe<T, U, VPT>(x + xo[t] + k, xt, rem);
                             for (int r = 0; r < ROWS; r++) {
-                                res[t][r] += qdot_safe<U, VPT, BITS>(wp + r * in_w, xt, dequantize_scale<U, GS>((sp + r * in_g)[0]), rem);
+                                if (out_row + r < NN) {
+                                    res[t][r] += qdot_safe<U, VPT, BITS>(wp + r * in_w, xt, dequantize_scale<U, GS>((sp + r * in_g)[0]), rem);
+                                }
                             }
                         }
                     }
@@ -264,25 +478,48 @@ def _gu_src(use_dedup: bool) -> str:
             const device uint8_t* sp = su0;
             int k = 0;
             for (; k < KK - KEND_SUB; k += BLOCK) {
-                thread uint32_t rw[ROWS][PPT];
-                U sv[ROWS];
+                if constexpr (HOIST_DQ) {
 #pragma unroll
-                for (int r = 0; r < ROWS; r++) {
-                    const device uint32_t* wptr = (const device uint32_t*)(wp + r * in_w);
+                    for (int r = 0; r < ROWS; r++) {
+                        const int rr = (out_row + r < NN) ? r : 0;
+                        const device uint32_t* wptr = (const device uint32_t*)(wp + rr * in_w);
+                        thread uint32_t rw[PPT];
 #pragma unroll
-                    for (int p = 0; p < PPT; p++) rw[r][p] = wptr[p];
-                    sv[r] = dequantize_scale<U, GS>((sp + r * in_g)[0]);
-                }
+                        for (int p = 0; p < PPT; p++) rw[p] = wptr[p];
+                        U sv = dequantize_scale<U, GS>((sp + rr * in_g)[0]);
+                        thread U d[VPT];
+                        dequant_vals_u32<BITS, VPT>(rw, d);
 #pragma unroll
-                for (int t = 0; t < TMAX; t++) {
-                    if (tb + t < cnt) {
-                        thread U xt[VPT];
-                        load_vector<T, U, VPT>(x + xo[t] + k, xt);
+                        for (int t = 0; t < TMAX; t++) {
+                            if (tb + t < cnt) {
+                                thread U xt[VPT];
+                                load_vector<T, U, VPT>(x + xo[t] + k, xt);
+                                res[t][r] += dot_vals<BITS, VPT>(xt, d, sv);
+                            }
+                        }
+                    }
+                } else {
+                    thread uint32_t rw[ROWS][PPT];
+                    U sv[ROWS];
 #pragma unroll
-                        for (int r = 0; r < ROWS; r++) {
-                            thread U d[VPT];
-                            dequant_vals<BITS, VPT>(rw[r], d);
-                            res[t][r] += dot_vals<BITS, VPT>(xt, d, sv[r]);
+                    for (int r = 0; r < ROWS; r++) {
+                        const int rr = (out_row + r < NN) ? r : 0;
+                        const device uint32_t* wptr = (const device uint32_t*)(wp + rr * in_w);
+#pragma unroll
+                        for (int p = 0; p < PPT; p++) rw[r][p] = wptr[p];
+                        sv[r] = dequantize_scale<U, GS>((sp + rr * in_g)[0]);
+                    }
+#pragma unroll
+                    for (int t = 0; t < TMAX; t++) {
+                        if (tb + t < cnt) {
+                            thread U xt[VPT];
+                            load_vector<T, U, VPT>(x + xo[t] + k, xt);
+#pragma unroll
+                            for (int r = 0; r < ROWS; r++) {
+                                thread U d[VPT];
+                                dequant_vals_u32<BITS, VPT>(rw[r], d);
+                                res[t][r] += dot_vals<BITS, VPT>(xt, d, sv[r]);
+                            }
                         }
                     }
                 }
@@ -297,7 +534,9 @@ def _gu_src(use_dedup: bool) -> str:
                             thread U xt[VPT];
                             load_vector_safe<T, U, VPT>(x + xo[t] + k, xt, rem);
                             for (int r = 0; r < ROWS; r++) {
-                                res[t][r] += qdot_safe<U, VPT, BITS>(wp + r * in_w, xt, dequantize_scale<U, GS>((sp + r * in_g)[0]), rem);
+                                if (out_row + r < NN) {
+                                    res[t][r] += qdot_safe<U, VPT, BITS>(wp + r * in_w, xt, dequantize_scale<U, GS>((sp + r * in_g)[0]), rem);
+                                }
                             }
                         }
                     }
@@ -308,7 +547,7 @@ def _gu_src(use_dedup: bool) -> str:
 #pragma unroll
                 for (int r = 0; r < ROWS; r++) {
                     U vu = simd_sum(res[t][r]);
-                    if (lane == 0 && tb + t < cnt) {
+                    if (lane == 0 && tb + t < cnt && out_row + r < NN) {
                         out[pqs[t] * NN + out_row + r] = glue_swiglu_bf16(g_bf[t][r], static_cast<T>(vu));
                     }
                 }
@@ -358,7 +597,26 @@ _DC_LOOP_CORE = r"""
                 int k = 0;
                 constexpr int KEND_SUB = (EXACT_BLK || FAST) ? 0 : BLOCK;
                 for (; k < KK - KEND_SUB; k += BLOCK) {
-                    if constexpr (HOIST_DQ) {
+                    if constexpr (HOIST_DQ == 2) {
+#pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            const device uint32_t* wp = (const device uint32_t*)(ws + r * in_w);
+                            thread uint32_t rw[PPT];
+#pragma unroll
+                            for (int p = 0; p < PPT; p++) rw[p] = wp[p];
+                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            thread U d[VPT];
+                            dequant_vals_u32<BITS, VPT>(rw, d);
+#pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (tb + t < cnt) {
+                                    thread U xt[VPT];
+                                    load_vector<T, U, VPT>(x + xo[t] + k, xt);
+                                    result[t][r] += dot_vals<BITS, VPT>(xt, d, sv);
+                                }
+                            }
+                        }
+                    } else if constexpr (HOIST_DQ == 1) {
                         thread T xt_bf[TMAX][VPT];
 #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
@@ -376,7 +634,7 @@ _DC_LOOP_CORE = r"""
                             for (int p = 0; p < PPT; p++) rw[p] = wp[p];
                             U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
                             thread U d[VPT];
-                            dequant_vals<BITS, VPT>(rw, d);
+                            dequant_vals_u32<BITS, VPT>(rw, d);
 #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (tb + t < cnt) {
@@ -405,7 +663,7 @@ _DC_LOOP_CORE = r"""
 #pragma unroll
                                 for (int r = 0; r < ROWS; r++) {
                                     thread U d[VPT];
-                                    dequant_vals<BITS, VPT>(rw[r], d);
+                                    dequant_vals_u32<BITS, VPT>(rw[r], d);
                                     result[t][r] += dot_vals<BITS, VPT>(xt, d, sv[r]);
                                 }
                             }
@@ -595,18 +853,27 @@ def moe_combine8_sh_res_rows(dn, wts, *, shared=None, residual=None):
     return out
 
 
-def moe_gate_up_swiglu_rows(x, wg, sg, wu, su, inds, *, group_size=32, bits=4, tmax=None, nsg=None, dedup=None):
+def moe_gate_up_swiglu_rows(x, wg, sg, wu, su, inds, *, group_size=32, bits=4, tmax=None, nsg=None, rows=None, hoist_dq=None, dedup=None, adaptive=None):
     B, E = inds.shape
     K = x.shape[-1]
     N = wg.shape[1]
     assert 1 <= B <= 24 and E == 8 and x.shape == (B, K) and x.dtype == mx.bfloat16
     fast = (N % 8 == 0) and (K % ((32 // bits) * 2 * 32) == 0)
+    if rows is None:
+        rw = 4
+    else:
+        rw = int(rows)
+    assert rw in (1, 2, 4) and N % rw == 0
     if tmax is None:
         tm = 2 if B >= 5 else _tmax(B, _GU_TMAX_CAP)
     else:
         tm = int(tmax)
     if nsg is None:
         nsg = 4 if B >= 5 else 2
+    hq = 0 if hoist_dq is None else int(hoist_dq)
+    if not fast or tm == 1:
+        hq = 0
+    ad = (int(B >= _GU_ADAPTIVE_MIN_B) if adaptive is None else int(bool(adaptive))) if rw == 4 else 0
     use_dedup = dedup is not None
     if use_dedup:
         u_exp, u_off, u_cnt, u_pqs, n_uniq = dedup
@@ -616,8 +883,8 @@ def moe_gate_up_swiglu_rows(x, wg, sg, wu, su, inds, *, group_size=32, bits=4, t
         inputs = [wg, sg, wu, su, x, inds_u32]
     (out,) = _gu_kernel(use_dedup)(
         inputs=inputs,
-        template=[("BB", B), ("GS", group_size), ("BITS", bits), ("FAST", fast), ("TMAX", tm), ("NSG", nsg), ("KK", K), ("NN", N)],
-        grid=(32, nsg * ((N + 4 * nsg - 1) // (4 * nsg)), B * E),
+        template=[("BB", B), ("GS", group_size), ("BITS", bits), ("FAST", fast), ("HOIST_DQ", hq), ("ADAPTIVE", ad), ("ROWS", rw), ("TMAX", tm), ("NSG", nsg), ("KK", K), ("NN", N)],
+        grid=(32, nsg * ((N + rw * nsg - 1) // (rw * nsg)), B * E),
         threadgroup=(32, nsg, 1),
         output_shapes=[(B, E, N)],
         output_dtypes=[mx.bfloat16],
@@ -639,13 +906,13 @@ def moe_down_combine_rows(h, wd, sd, inds, wts, *, shared=None, residual=None, g
     sh = shared if has_sh else _ZERO_BF16
     rs = residual if has_res else _ZERO_BF16
     if tmax is None:
-        tm = 4 if B >= 17 else (2 if B >= 8 else _tmax(B, _DC_TMAX_CAP))
+        tm = 4 if B >= 21 else (2 if B >= 8 else _tmax(B, _DC_TMAX_CAP))
     else:
         tm = int(tmax)
     if hoist_dq is None:
         hdq = int(B >= 8 and tm > 1)
     else:
-        hdq = int(bool(hoist_dq))
+        hdq = int(hoist_dq)
     if not (fast or exact_blk) or tm == 1:
         hdq = 0
     use_dedup = dedup is not None
