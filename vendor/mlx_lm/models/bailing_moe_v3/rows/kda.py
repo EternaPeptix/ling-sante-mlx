@@ -1914,3 +1914,559 @@ def kda_conv_commit_rows(
         output_shapes=[(C, 3, 8192)] * 3,
         output_dtypes=[cs0.dtype] * 3,
     )
+
+
+# ---------------------------------------------------------------------------
+# Mega-fused 1-launch KDA (pre_seq + [optional lazy_commit] + gdn_verify + o_norm_gate)
+# 1 TG owns 1 full head (128 dv rows in 16/NSG contiguous passes), eliminating `q` & `y_raw`
+# DRAM traffic and cutting 3 launches/layer (189) -> 1 launch/layer (63) for MAX_L <= 16.
+# ---------------------------------------------------------------------------
+def _kda_mega_fused_src(
+    split_c: int, has_prev: bool, write_end: bool, varlen: bool, emit_kvgb: bool
+) -> str:
+    cur_bounds = (
+        """
+    const int cur_off = stream_off[c];
+    const int cur_L = stream_L[c];
+"""
+        if varlen
+        else """
+    const int cur_off = int(c) * MAX_L;
+    const int cur_L = MAX_L;
+"""
+    )
+    if split_c == 0:
+        ptr = """
+    const size_t st_base_h = size_t(n) * D;
+    const device float* st_in_h = state_in + st_base_h * D;
+"""
+        if has_prev:
+            ptr += "    device float* st_cm_h = state_commit + st_base_h * D;\n"
+        if write_end:
+            ptr += "    device float* st_ou_h = state_out + st_base_h * D;\n"
+    else:
+        ptr = """
+    const size_t st_base_h = size_t(h) * D;
+    const device float* st_in_h = si0 + st_base_h * D;
+"""
+        if has_prev:
+            ptr += "    device float* st_cm_h = sc0 + st_base_h * D;\n"
+        if write_end:
+            ptr += "    device float* st_ou_h = so0 + st_base_h * D;\n"
+        for i in range(1, split_c):
+            kw = "if" if i == 1 else "else if"
+            sets = [f"st_in_h = si{i} + st_base_h * D;"]
+            if has_prev:
+                sets.append(f"st_cm_h = sc{i} + st_base_h * D;")
+            if write_end:
+                sets.append(f"st_ou_h = so{i} + st_base_h * D;")
+            ptr += f"    {kw} (c == {i}) {{ {' '.join(sets)} }}\n"
+
+    emit_beta = "beta_out[b * NH + h] = bt;" if emit_kvgb else ""
+    emit_vg = (
+        """
+      *(device bfloat4*)(v_out + row_off + c0) = v_silu;
+      *(device float4*)(g_out + row_off + c0) = g4;
+"""
+        if emit_kvgb
+        else ""
+    )
+    emit_k = "*(device bfloat4*)(k_out + row_off + c0) = ko4;" if emit_kvgb else ""
+
+    prev_block = (
+        r"""
+      const int p_nc = prev_nc[c];
+      const int p_off = prev_off[c];
+      for (int t = 0; t < p_nc; ++t) {
+        const size_t pb_idx = size_t(p_off + t);
+        const size_t hoff = pb_idx * PROJ + h_off;
+        const float bt = prev_beta[pb_idx * NH + h];
+        const device bfloat4* k4p = (const device bfloat4*)(prev_k + hoff + k_base);
+        const device float4* g4p = (const device float4*)(prev_g + hoff + k_base);
+        float part[PPL];
+#pragma unroll
+        for (int pb = 0; pb < PPL; ++pb) {
+          float4 s4 = st[pb] * g4p[pb];
+          st[pb] = s4;
+          float4 k4 = float4(k4p[pb]);
+          float acc = 0.0f;
+          acc += s4.x * k4.x;
+          acc += s4.y * k4.y;
+          acc += s4.z * k4.z;
+          acc += s4.w * k4.w;
+          part[pb] = acc;
+        }
+        float kv_mem =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        kv_mem += simd_shuffle_xor(kv_mem, 1);
+        kv_mem += simd_shuffle_xor(kv_mem, 2);
+        float delta = (static_cast<float>(prev_v[hoff + dv_idx]) - kv_mem) * bt;
+#pragma unroll
+        for (int pb = 0; pb < PPL; ++pb) {
+          st[pb] = st[pb] + float4(k4p[pb]) * delta;
+        }
+      }
+      device float4* c_st4 = (device float4*)(st_cm_h + size_t(dv_idx) * D + k_base);
+#pragma unroll
+      for (int pb = 0; pb < PPL; ++pb) {
+        c_st4[pb] = st[pb];
+      }
+"""
+        if has_prev
+        else ""
+    )
+
+    end_store = (
+        r"""
+      device float4* o_st4 = (device float4*)(st_ou_h + size_t(dv_idx) * D + k_base);
+#pragma unroll
+      for (int pb = 0; pb < PPL; ++pb) {
+        o_st4[pb] = st[pb];
+      }
+"""
+        if write_end
+        else ""
+    )
+
+    return (
+        r"""
+    constexpr int NH = 64;
+    constexpr int D = 128;
+    constexpr int PROJ = NH * D;
+    constexpr int LPR = 4;
+    constexpr int RPS = 32 / LPR;   // 8 rows/sg
+    constexpr int VPL = D / LPR;    // 32 elems/lane
+    constexpr int PPL = VPL / 4;    // 8 float4s
+    constexpr int RPTG = RPS * NSG;
+    constexpr int NPASS = D / RPTG;
+
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint n = threadgroup_position_in_grid.z;  // c * NH + h
+    const uint c = n / NH;
+    const uint h = n % NH;
+    const size_t h_off = size_t(h) * D;
+    const int c0 = int(lane) * 4;
+"""
+        + cur_bounds
+        + ptr
+        + r"""
+    threadgroup bfloat16_t tg_q[MAX_L][D];
+    threadgroup bfloat16_t tg_k[MAX_L][D];
+    threadgroup bfloat16_t tg_v[MAX_L][D];
+    threadgroup float tg_g[MAX_L][D];
+    threadgroup float tg_beta[MAX_L];
+    threadgroup bfloat16_t tg_y[MAX_L][D];
+
+    const device T* cs0_r = cs0 + size_t(c) * 3 * PROJ + h_off;
+    const device T* cs1_r = cs1 + size_t(c) * 3 * PROJ + h_off;
+    const device T* cs2_r = cs2 + size_t(c) * 3 * PROJ + h_off;
+    const float expA = metal::precise::exp(static_cast<float>(A_log[h]));
+    const float4 dt4 = *(const device float4*)(dt_bias + h_off + c0);
+    const T q_sc = static_cast<T>(INV_SCALE_SQ);
+    const T k_sc = static_cast<T>(INV_SCALE);
+
+    bfloat4 wq4[4], wk4[4], wv4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const size_t gc = h_off + c0 + i;
+      wq4[i] = *(const device bfloat4*)(wq + gc * 4);
+      wk4[i] = *(const device bfloat4*)(wk + gc * 4);
+      wv4[i] = *(const device bfloat4*)(wv + gc * 4);
+    }
+
+    // Phase 1: Fused kda_pre_seq across t = 0..cur_L-1
+    for (int t = int(sg); t < cur_L; t += NSG) {
+      const size_t b = size_t(cur_off + t);
+      const size_t row_off = b * PROJ + h_off;
+      if (lane == 0) {
+        float bt = glue_sigmoid(static_cast<float>(b_raw[b * NH + h]));
+        tg_beta[t] = bt;
+        """
+        + emit_beta
+        + r"""
+      }
+      bfloat4 qx4 = *(const device bfloat4*)(q_raw + row_off + c0);
+      bfloat4 kx4 = *(const device bfloat4*)(k_raw + row_off + c0);
+      bfloat4 vx4 = *(const device bfloat4*)(v_raw + row_off + c0);
+
+      bfloat4 qp0 = (t < 3) ? *(const device bfloat4*)(cs0_r + size_t(t) * PROJ + c0)
+                            : *(const device bfloat4*)(q_raw + size_t(b - 3) * PROJ + h_off + c0);
+      bfloat4 qp1 = (t < 2) ? *(const device bfloat4*)(cs0_r + size_t(t + 1) * PROJ + c0)
+                            : *(const device bfloat4*)(q_raw + size_t(b - 2) * PROJ + h_off + c0);
+      bfloat4 qp2 = (t < 1) ? *(const device bfloat4*)(cs0_r + size_t(t + 2) * PROJ + c0)
+                            : *(const device bfloat4*)(q_raw + size_t(b - 1) * PROJ + h_off + c0);
+
+      bfloat4 kp0 = (t < 3) ? *(const device bfloat4*)(cs1_r + size_t(t) * PROJ + c0)
+                            : *(const device bfloat4*)(k_raw + size_t(b - 3) * PROJ + h_off + c0);
+      bfloat4 kp1 = (t < 2) ? *(const device bfloat4*)(cs1_r + size_t(t + 1) * PROJ + c0)
+                            : *(const device bfloat4*)(k_raw + size_t(b - 2) * PROJ + h_off + c0);
+      bfloat4 kp2 = (t < 1) ? *(const device bfloat4*)(cs1_r + size_t(t + 2) * PROJ + c0)
+                            : *(const device bfloat4*)(k_raw + size_t(b - 1) * PROJ + h_off + c0);
+
+      bfloat4 vp0 = (t < 3) ? *(const device bfloat4*)(cs2_r + size_t(t) * PROJ + c0)
+                            : *(const device bfloat4*)(v_raw + size_t(b - 3) * PROJ + h_off + c0);
+      bfloat4 vp1 = (t < 2) ? *(const device bfloat4*)(cs2_r + size_t(t + 1) * PROJ + c0)
+                            : *(const device bfloat4*)(v_raw + size_t(b - 2) * PROJ + h_off + c0);
+      bfloat4 vp2 = (t < 1) ? *(const device bfloat4*)(cs2_r + size_t(t + 2) * PROJ + c0)
+                            : *(const device bfloat4*)(v_raw + size_t(b - 1) * PROJ + h_off + c0);
+
+      bfloat4 f4 = *(const device bfloat4*)(f_raw + row_off + c0);
+      bfloat4 q_silu, k_silu, v_silu;
+      float4 g4;
+      float q_acc = 0.0f, k_acc = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float qc = 0.0f;
+        qc += static_cast<float>(qp0[i]) * static_cast<float>(wq4[i][0]);
+        qc += static_cast<float>(qp1[i]) * static_cast<float>(wq4[i][1]);
+        qc += static_cast<float>(qp2[i]) * static_cast<float>(wq4[i][2]);
+        qc += static_cast<float>(qx4[i]) * static_cast<float>(wq4[i][3]);
+        T qcb = static_cast<T>(qc);
+        q_silu[i] = qcb * glue_sigmoid_bf16(qcb);
+        float qf = static_cast<float>(q_silu[i]);
+        q_acc = fma(qf, qf, q_acc);
+
+        float kc = 0.0f;
+        kc += static_cast<float>(kp0[i]) * static_cast<float>(wk4[i][0]);
+        kc += static_cast<float>(kp1[i]) * static_cast<float>(wk4[i][1]);
+        kc += static_cast<float>(kp2[i]) * static_cast<float>(wk4[i][2]);
+        kc += static_cast<float>(kx4[i]) * static_cast<float>(wk4[i][3]);
+        T kcb = static_cast<T>(kc);
+        k_silu[i] = kcb * glue_sigmoid_bf16(kcb);
+        float kf = static_cast<float>(k_silu[i]);
+        k_acc = fma(kf, kf, k_acc);
+
+        float vc = 0.0f;
+        vc += static_cast<float>(vp0[i]) * static_cast<float>(wv4[i][0]);
+        vc += static_cast<float>(vp1[i]) * static_cast<float>(wv4[i][1]);
+        vc += static_cast<float>(vp2[i]) * static_cast<float>(wv4[i][2]);
+        vc += static_cast<float>(vx4[i]) * static_cast<float>(wv4[i][3]);
+        T vcb = static_cast<T>(vc);
+        v_silu[i] = vcb * glue_sigmoid_bf16(vcb);
+
+        float fval = static_cast<float>(f4[i]) + dt4[i];
+        g4[i] = metal::precise::exp(LOWER_BOUND * glue_sigmoid(expA * fval));
+      }
+      *(threadgroup bfloat4*)(tg_v[t] + c0) = v_silu;
+      *(threadgroup float4*)(tg_g[t] + c0) = g4;
+      """
+        + emit_vg
+        + r"""
+      float q_inv = metal::precise::rsqrt(simd_sum(q_acc) / 128.0f + RMS_EPS);
+      float k_inv = metal::precise::rsqrt(simd_sum(k_acc) / 128.0f + RMS_EPS);
+      bfloat4 qo4, ko4;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        qo4[i] = q_sc * static_cast<T>(static_cast<float>(q_silu[i]) * q_inv);
+        ko4[i] = k_sc * static_cast<T>(static_cast<float>(k_silu[i]) * k_inv);
+      }
+      *(threadgroup bfloat4*)(tg_q[t] + c0) = qo4;
+      *(threadgroup bfloat4*)(tg_k[t] + c0) = ko4;
+      """
+        + emit_k
+        + r"""
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: Contiguous multi-pass GDN (+ optional lazy commit) over all 128 dv rows
+    const uint row_in_sg = lane / LPR;
+    const uint lane_in_row = lane & (LPR - 1);
+    const uint k_base = lane_in_row * VPL;
+
+    for (int pass = 0; pass < NPASS; ++pass) {
+      const uint dv_idx = uint(pass) * RPTG + sg * RPS + row_in_sg;
+      const device float4* i_st4 = (const device float4*)(st_in_h + size_t(dv_idx) * D + k_base);
+      float4 st[PPL];
+#pragma unroll
+      for (int pb = 0; pb < PPL; ++pb) {
+        st[pb] = i_st4[pb];
+      }
+"""
+        + prev_block
+        + r"""
+      for (int t = 0; t < cur_L; ++t) {
+        const threadgroup bfloat4* k4p = (const threadgroup bfloat4*)(tg_k[t] + k_base);
+        const threadgroup bfloat4* q4p = (const threadgroup bfloat4*)(tg_q[t] + k_base);
+        const threadgroup float4* g4p = (const threadgroup float4*)(tg_g[t] + k_base);
+        const float bt = tg_beta[t];
+        float part[PPL];
+#pragma unroll
+        for (int pb = 0; pb < PPL; ++pb) {
+          float4 s4 = st[pb] * g4p[pb];
+          st[pb] = s4;
+          float4 k4 = float4(k4p[pb]);
+          float acc = 0.0f;
+          acc += s4.x * k4.x;
+          acc += s4.y * k4.y;
+          acc += s4.z * k4.z;
+          acc += s4.w * k4.w;
+          part[pb] = acc;
+        }
+        float kv_mem =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        kv_mem += simd_shuffle_xor(kv_mem, 1);
+        kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+        float delta = (static_cast<float>(tg_v[t][dv_idx]) - kv_mem) * bt;
+
+#pragma unroll
+        for (int pb = 0; pb < PPL; ++pb) {
+          float4 s4 = st[pb] + float4(k4p[pb]) * delta;
+          st[pb] = s4;
+          float4 q4 = float4(q4p[pb]);
+          float acc = 0.0f;
+          acc += s4.x * q4.x;
+          acc += s4.y * q4.y;
+          acc += s4.z * q4.z;
+          acc += s4.w * q4.w;
+          part[pb] = acc;
+        }
+        float out_v =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        out_v += simd_shuffle_xor(out_v, 1);
+        out_v += simd_shuffle_xor(out_v, 2);
+        if (lane_in_row == 0) {
+          tg_y[t][dv_idx] = static_cast<T>(out_v);
+        }
+      }
+"""
+        + end_store
+        + r"""
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: Fused o_norm * sigmoid(g_raw) straight from tg_y
+    const bfloat4 w4 = *(const device bfloat4*)(o_norm_w + c0);
+    for (int t = int(sg); t < cur_L; t += NSG) {
+      const size_t b = size_t(cur_off + t);
+      const size_t row_off = b * PROJ + h_off;
+      bfloat4 y4 = *(const threadgroup bfloat4*)(tg_y[t] + c0);
+      float4 yf = float4(y4);
+      float acc = 0.0f;
+      acc = fma(yf.x, yf.x, acc);
+      acc = fma(yf.y, yf.y, acc);
+      acc = fma(yf.z, yf.z, acc);
+      acc = fma(yf.w, yf.w, acc);
+      float inv = metal::precise::rsqrt(simd_sum(acc) / 128.0f + O_EPS);
+      bfloat4 g4 = *(const device bfloat4*)(g_raw + row_off + c0);
+      bfloat4 out4;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        T normed = static_cast<T>(w4[i]) * static_cast<T>(yf[i] * inv);
+        T gate = static_cast<T>(glue_sigmoid(static_cast<float>(g4[i])));
+        out4[i] = normed * gate;
+      }
+      *(device bfloat4*)(out_vec + row_off + c0) = out4;
+    }
+"""
+    )
+
+
+def _kda_mega_fused_kernel(
+    lower_bound: float,
+    rms_eps: float,
+    inv_scale: float,
+    o_eps: float,
+    split_c: int,
+    has_prev: bool,
+    write_end: bool,
+    varlen: bool,
+    emit_kvgb: bool,
+):
+    key = (
+        "mega_fused",
+        float(lower_bound),
+        float(rms_eps),
+        float(inv_scale),
+        float(o_eps),
+        split_c,
+        has_prev,
+        write_end,
+        varlen,
+        emit_kvgb,
+    )
+    k = _KERNELS.get(key)
+    if k is None:
+        hdr = _KDA_HELPER_HDR + f"""
+#define LOWER_BOUND {flit(lower_bound)}
+#define RMS_EPS {flit(rms_eps)}
+#define INV_SCALE {flit(inv_scale)}
+#define INV_SCALE_SQ {flit(inv_scale * inv_scale)}
+#define O_EPS {flit(o_eps)}
+"""
+        in_names = [
+            "q_raw", "k_raw", "v_raw", "f_raw", "g_raw", "b_raw",
+            "cs0", "cs1", "cs2", "wq", "wk", "wv", "A_log", "dt_bias", "o_norm_w",
+        ]
+        if split_c == 0:
+            in_names.append("state_in")
+        else:
+            in_names += [f"si{i}" for i in range(split_c)]
+        if has_prev:
+            in_names += ["prev_k", "prev_v", "prev_g", "prev_beta", "prev_off", "prev_nc"]
+        if varlen:
+            in_names += ["stream_off", "stream_L"]
+
+        out_names = ["out_vec"]
+        if has_prev:
+            if split_c == 0:
+                out_names.append("state_commit")
+            else:
+                out_names += [f"sc{i}" for i in range(split_c)]
+        if write_end:
+            if split_c == 0:
+                out_names.append("state_out")
+            else:
+                out_names += [f"so{i}" for i in range(split_c)]
+        if emit_kvgb:
+            out_names += ["k_out", "v_out", "g_out", "beta_out"]
+
+        k = _KERNELS[key] = mx.fast.metal_kernel(
+            name=f"bv3_kda_mf_c{split_c}_p{int(has_prev)}_e{int(write_end)}_v{int(varlen)}_k{int(emit_kvgb)}",
+            input_names=in_names,
+            output_names=out_names,
+            header=hdr,
+            source=_kda_mega_fused_src(split_c, has_prev, write_end, varlen, emit_kvgb),
+            ensure_row_contiguous=True,
+        )
+    return k
+
+
+def _mega_nsg(C: int, max_l: int, nsg: int | None) -> int:
+    if nsg is not None:
+        return int(nsg)
+    return 8 if (C == 1 and 4 <= max_l <= 7) else 4
+
+
+def kda_fused_verify_rows(
+    q_raw: mx.array,
+    k_raw: mx.array,
+    v_raw: mx.array,
+    f_raw: mx.array,
+    g_raw: mx.array,
+    b_raw: mx.array,
+    cs0: mx.array,
+    cs1: mx.array,
+    cs2: mx.array,
+    wq: mx.array,
+    wk: mx.array,
+    wv: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state_in,
+    o_norm_w: mx.array,
+    *,
+    C: int,
+    L: int | None = None,
+    Ls: list[int] | None = None,
+    lower_bound: float = -5.0,
+    eps: float = 1e-6,
+    o_eps: float = 1e-6,
+    write_end: bool = True,
+    emit_kvgb: bool = True,
+    nsg: int | None = None,
+    prev_k: mx.array | None = None,
+    prev_v: mx.array | None = None,
+    prev_g: mx.array | None = None,
+    prev_beta: mx.array | None = None,
+    prev_off=None,
+    prev_nc=None,
+    stream_off: mx.array | None = None,
+    stream_L: mx.array | None = None,
+):
+    """1-launch mega-fused KDA (pre_seq + [optional lazy_commit] + gdn_verify + o_norm_gate).
+
+    Supports uniform `(C, L)` or varlen `Ls` (with `max_L <= 16`), contiguous `state_in` or
+    per-stream split `list[mx.array]`, and optional lazy commit (`prev_k is not None`).
+    Returns `(ov, s_commit_or_None, s_end_or_None, k_out, v_out, g_out, beta_out)` where unused
+    entries are `None`.
+    """
+    varlen = Ls is not None
+    if varlen:
+        assert len(Ls) == C and all(lc >= 1 for lc in Ls)
+        B = sum(Ls)
+        max_l = max(Ls)
+        if stream_off is None or stream_L is None:
+            stream_off, stream_L = _varlen_offs_ls(Ls)
+    else:
+        assert L is not None and L >= 1
+        B = C * L
+        max_l = L
+    assert 1 <= max_l <= 16 and q_raw.shape == (B, 8192)
+    is_split = isinstance(state_in, list)
+    split_c = C if is_split else 0
+    if is_split:
+        assert 2 <= C <= 4 and len(state_in) == C
+    else:
+        assert state_in.shape == (C, 64, 128, 128) and state_in.dtype == mx.float32
+
+    has_prev = prev_k is not None
+    nsg_v = _mega_nsg(C, max_l, nsg)
+    assert 128 % (8 * nsg_v) == 0
+
+    inv_scale = 128.0 ** -0.5
+    rms_eps = eps * (inv_scale * inv_scale)
+    inputs = [
+        q_raw, k_raw, v_raw, f_raw, g_raw, b_raw,
+        cs0, cs1, cs2, wq, wk, wv, A_log, dt_bias, o_norm_w,
+    ]
+    if is_split:
+        inputs.extend(state_in)
+    else:
+        inputs.append(state_in)
+    if has_prev:
+        inputs += [prev_k, prev_v, prev_g, prev_beta, _to_i32(prev_off), _to_i32(prev_nc)]
+    if varlen:
+        inputs += [stream_off, stream_L]
+
+    st_shapes = [(1, 64, 128, 128)] * C if is_split else [(C, 64, 128, 128)]
+    st_dtypes = [mx.float32] * len(st_shapes)
+    out_shapes = [(B, 8192)]
+    out_dtypes = [q_raw.dtype]
+    if has_prev:
+        out_shapes += st_shapes
+        out_dtypes += st_dtypes
+    if write_end:
+        out_shapes += st_shapes
+        out_dtypes += st_dtypes
+    if emit_kvgb:
+        out_shapes += [(B, 8192), (B, 8192), (B, 8192), (B, 64)]
+        out_dtypes += [q_raw.dtype, q_raw.dtype, mx.float32, mx.float32]
+    assert len(inputs) + len(out_shapes) <= 31, f"Metal 31-buffer limit exceeded ({len(inputs)}+{len(out_shapes)})"
+
+    outs = _kda_mega_fused_kernel(
+        lower_bound, rms_eps, inv_scale, o_eps, split_c, has_prev, write_end, varlen, emit_kvgb
+    )(
+        inputs=inputs,
+        template=[
+            ("T", q_raw.dtype),
+            ("NSG", nsg_v),
+            ("MAX_L", max_l),
+        ],
+        grid=(32, nsg_v, C * 64),
+        threadgroup=(32, nsg_v, 1),
+        output_shapes=out_shapes,
+        output_dtypes=out_dtypes,
+    )
+    idx = 0
+    ov = outs[idx]; idx += 1
+    n_st = len(st_shapes)
+    if has_prev:
+        s_commit = list(outs[idx : idx + n_st]) if is_split else outs[idx]
+        idx += n_st
+    else:
+        s_commit = None
+    if write_end:
+        s_end = list(outs[idx : idx + n_st]) if is_split else outs[idx]
+        idx += n_st
+    else:
+        s_end = None
+    if emit_kvgb:
+        k_o, v_o, g_o, b_o = outs[idx : idx + 4]
+    else:
+        k_o = v_o = g_o = b_o = None
+    return ov, s_commit, s_end, k_o, v_o, g_o, b_o

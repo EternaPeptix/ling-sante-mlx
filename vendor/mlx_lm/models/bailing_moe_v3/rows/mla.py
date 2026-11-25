@@ -161,8 +161,6 @@ _CAUSAL_ADD_SOFTMAX_SRC = r"""
     const uint nsg = lsize / 32;
     const uint row = threadgroup_position_in_grid.z;  // t * 64 + h
     const int t = int(row / 64);
-    const int S_end = params[0];
-    const int S_base = params[1];
     const int valid_len = S_base + t + 1;
 
     const device bfloat16_t* qk_r = qk + size_t(row) * S_end;
@@ -236,12 +234,9 @@ _ADD_SOFTMAX_STRIDED_SRC = r"""
     const uint sg = simdgroup_index_in_threadgroup;
     const uint nsg = lsize / 32;
     const uint h = threadgroup_position_in_grid.z;
-    const int valid_len = params[0];
-    const int pe_stride = params[1];
-    const int t = params[2];
 
     const device bfloat16_t* qk_r = qk + size_t(h) * valid_len;
-    const device bfloat16_t* pe_r = pe + size_t(t * 64 + int(h)) * pe_stride;
+    const device bfloat16_t* pe_r = pe + size_t(t_idx * 64 + int(h)) * pe_stride;
     device bfloat16_t* pr_r = pr + size_t(h) * valid_len;
 
     float ld[N_READS];
@@ -301,6 +296,93 @@ _ADD_SOFTMAX_STRIDED_SRC = r"""
       }
     }
 """
+
+
+def _add_softmax_multi_src(lc: int) -> str:
+    sel = [
+        "    const device bfloat16_t* qk_r = qk0 + size_t(h) * valid_len;",
+        "    device bfloat16_t* pr_r = pr0 + size_t(h) * valid_len;",
+    ]
+    for i in range(1, lc):
+        kw = "if" if i == 1 else "else if"
+        sel.append(
+            f"    {kw} (t == {i}) {{ qk_r = qk{i} + size_t(h) * valid_len; pr_r = pr{i} + size_t(h) * valid_len; }}"
+        )
+    return (
+        r"""
+    constexpr int N_READS = 4;
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint lsize = threads_per_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint nsg = lsize / 32;
+    const uint row = threadgroup_position_in_grid.z;
+    const int t = int(row / 64);
+    const uint h = row % 64;
+    const int valid_len = S_base + t + 1;
+    const device bfloat16_t* pe_r = pe + size_t(row) * pe_stride;
+"""
+        + "\n".join(sel)
+        + r"""
+
+    float ld[N_READS];
+    float maxval = -INFINITY;
+    const int base = int(lid) * N_READS;
+#pragma unroll
+    for (int i = 0; i < N_READS; ++i) {
+      int idx = base + i;
+      if (idx < valid_len) {
+        bfloat16_t sc = qk_r[idx] + pe_r[idx];
+        float v = static_cast<float>(sc);
+        ld[i] = v;
+        maxval = metal::max(maxval, v);
+      } else {
+        ld[i] = -INFINITY;
+      }
+    }
+
+    threadgroup float local_max[32];
+    maxval = simd_max(maxval);
+    if (lane == 0) local_max[sg] = maxval;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float m = (lane < nsg) ? local_max[lane] : -INFINITY;
+      m = simd_max(m);
+      if (lane == 0) local_max[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    maxval = local_max[0];
+
+    float normalizer = 0.0f;
+#pragma unroll
+    for (int i = 0; i < N_READS; ++i) {
+      int idx = base + i;
+      float ex = (idx < valid_len) ? metal::fast::exp(ld[i] - maxval) : 0.0f;
+      ld[i] = ex;
+      normalizer += ex;
+    }
+
+    threadgroup float local_norm[32];
+    normalizer = simd_sum(normalizer);
+    if (lane == 0) local_norm[sg] = normalizer;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float s = (lane < nsg) ? local_norm[lane] : 0.0f;
+      s = simd_sum(s);
+      if (lane == 0) local_norm[0] = 1.0f / s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_norm = local_norm[0];
+
+#pragma unroll
+    for (int i = 0; i < N_READS; ++i) {
+      int idx = base + i;
+      if (idx < valid_len) {
+        pr_r[idx] = bfloat16_t(ld[i] * inv_norm);
+      }
+    }
+"""
+    )
 
 _ML_SRC = r"""
     // Multi-head batched GEMV: out[b, h, 0, n] = x[b, h, 0, :KK] @ w[h, n, :].T
@@ -383,6 +465,7 @@ _ML_SRC = r"""
 """
 
 _ML_FP8_SRC = r"""
+    // Low-TG contiguous looped FP8 MultiLinear (cuts 4096/1024 TGs -> <=512 TGs, hoists x at KK==128).
     constexpr int BM = 4;
     constexpr int TN = 4;
     constexpr int blockM = BM * TM;
@@ -394,74 +477,81 @@ _ML_FP8_SRC = r"""
     const int b_sg = int(sg_all) % BSG;
     const int b0 = b_sg * B_SUB;
     const uint tgx = threadgroup_position_in_grid.x;
+    const uint n_tgx = threadgroups_per_grid.x;
     const uint h = threadgroup_position_in_grid.z;
 
-    const int out_row = int(tgx) * blockM + sg * TM;
-    if (out_row >= NN) return;
+    const int n_tiles = NN / blockM;
+    const int tiles_per_tg = (n_tiles + int(n_tgx) - 1) / int(n_tgx);
+    const int tile_beg = int(tgx) * tiles_per_tg;
+    const int tile_end = min(n_tiles, tile_beg + tiles_per_tg);
 
-    const device uchar* mat = w + size_t(h) * NN * KK + size_t(out_row) * KK;
     const device float* sc_h = sc_inv + size_t(h) * 4;
-    int bn = int(lane) * TN;
-    float res[B_SUB][TM];
-#pragma unroll
-    for (int bi = 0; bi < B_SUB; ++bi)
-#pragma unroll
-      for (int tm = 0; tm < TM; ++tm)
-        res[bi][tm] = 0.0f;
-
-    float sc_n256 = 0.0f;
-    if constexpr (SCALE_BY_N) {
-      sc_n256 = simd_broadcast_first(sc_h[out_row >> 7] * 256.0f);
-    }
+    const T sc_t = HAS_SCALE ? scale_arr[0] : static_cast<T>(1.0f);
 
     constexpr int n_iter = KK / blockN;
-    for (int i = 0; i < n_iter; ++i) {
-      const float sc256 = SCALE_BY_N ? sc_n256 : simd_broadcast_first(sc_h[i] * 256.0f);
-      bfloat4 wf[TM];
+    for (int tile = tile_beg; tile < tile_end; ++tile) {
+      const int out_row = tile * blockM + sg * TM;
+      const device uchar* mat = w + size_t(h) * NN * KK + size_t(out_row) * KK;
+      int bn = int(lane) * TN;
+      float res[B_SUB][TM];
 #pragma unroll
-      for (int tm = 0; tm < TM; ++tm) {
-        const uchar4 pk = *(const device uchar4*)(mat + size_t(tm) * KK + bn);
-        wf[tm] = glue_e4m3x4_to_bf4(pk, sc256);
+      for (int bi = 0; bi < B_SUB; ++bi)
+#pragma unroll
+        for (int tm = 0; tm < TM; ++tm)
+          res[bi][tm] = 0.0f;
+
+      float sc_n256 = 0.0f;
+      if constexpr (SCALE_BY_N) {
+        sc_n256 = simd_broadcast_first(sc_h[out_row >> 7] * 256.0f);
       }
+
+      for (int i = 0; i < n_iter; ++i) {
+        const float sc256 = SCALE_BY_N ? sc_n256 : simd_broadcast_first(sc_h[i] * 256.0f);
+        bfloat4 wf[TM];
+#pragma unroll
+        for (int tm = 0; tm < TM; ++tm) {
+          const uchar4 pk = *(const device uchar4*)(mat + size_t(tm) * KK + bn);
+          wf[tm] = glue_e4m3x4_to_bf4(pk, sc256);
+        }
+#pragma unroll
+        for (int bi = 0; bi < B_SUB; ++bi) {
+          const int b = b0 + bi;
+          if (b < BB) {
+            float4 vc = static_cast<float4>(
+                *(const device vec<T, 4>*)(x + (size_t(b) * NH + h) * IN_STRIDE + bn));
+#pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+              float4 w4 = float4(wf[tm]);
+              res[bi][tm] += w4.x * vc.x;
+              res[bi][tm] += w4.y * vc.y;
+              res[bi][tm] += w4.z * vc.z;
+              res[bi][tm] += w4.w * vc.w;
+            }
+          }
+        }
+        bn += blockN;
+      }
+
 #pragma unroll
       for (int bi = 0; bi < B_SUB; ++bi) {
         const int b = b0 + bi;
         if (b < BB) {
-          float4 vc = static_cast<float4>(
-              *(const device vec<T, 4>*)(x + (size_t(b) * NH + h) * IN_STRIDE + bn));
+          T gate = static_cast<T>(1.0f);
+          if constexpr (HAS_GATE) {
+            gate = static_cast<T>(glue_sigmoid(static_cast<float>(g_raw[size_t(b) * NH + h])));
+          }
 #pragma unroll
           for (int tm = 0; tm < TM; ++tm) {
-            float4 w4 = float4(wf[tm]);
-            res[bi][tm] += w4.x * vc.x;
-            res[bi][tm] += w4.y * vc.y;
-            res[bi][tm] += w4.z * vc.z;
-            res[bi][tm] += w4.w * vc.w;
-          }
-        }
-      }
-      bn += blockN;
-    }
-
-    const T sc_t = HAS_SCALE ? scale_arr[0] : static_cast<T>(1.0f);
 #pragma unroll
-    for (int bi = 0; bi < B_SUB; ++bi) {
-      const int b = b0 + bi;
-      if (b < BB) {
-        T gate = static_cast<T>(1.0f);
-        if constexpr (HAS_GATE) {
-          gate = static_cast<T>(glue_sigmoid(static_cast<float>(g_raw[size_t(b) * NH + h])));
-        }
-#pragma unroll
-        for (int tm = 0; tm < TM; ++tm) {
-#pragma unroll
-          for (ushort sn = 16; sn >= 1; sn >>= 1) {
-            res[bi][tm] += simd_shuffle_down(res[bi][tm], sn);
-          }
-          if (lane == 0) {
-            T v = static_cast<T>(res[bi][tm]);
-            if constexpr (HAS_SCALE) v = v * sc_t;
-            if constexpr (HAS_GATE) v = v * gate;
-            out[(size_t(b) * NH + h) * NN + out_row + tm] = v;
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+              res[bi][tm] += simd_shuffle_down(res[bi][tm], sn);
+            }
+            if (lane == 0) {
+              T v = static_cast<T>(res[bi][tm]);
+              if constexpr (HAS_SCALE) v = v * sc_t;
+              if constexpr (HAS_GATE) v = v * gate;
+              out[(size_t(b) * NH + h) * NN + out_row + tm] = v;
+            }
           }
         }
       }
@@ -524,7 +614,7 @@ def _causal_add_softmax_kernel():
     if k is None:
         k = _KERNELS["causal_add_sm"] = mx.fast.metal_kernel(
             name="bv3_mla_causal_add_softmax",
-            input_names=["qk", "pe", "params"],
+            input_names=["qk", "pe", "S_end", "S_base"],
             output_names=["pr"],
             header=GLUE_HEADER,
             source=_CAUSAL_ADD_SOFTMAX_SRC,
@@ -538,10 +628,25 @@ def _add_softmax_strided_kernel():
     if k is None:
         k = _KERNELS["add_sm_strided"] = mx.fast.metal_kernel(
             name="bv3_mla_add_softmax_strided",
-            input_names=["qk", "pe", "params"],
+            input_names=["qk", "pe", "valid_len", "pe_stride", "t_idx"],
             output_names=["pr"],
             header=GLUE_HEADER,
             source=_ADD_SOFTMAX_STRIDED_SRC,
+            ensure_row_contiguous=True,
+        )
+    return k
+
+
+def _add_softmax_multi_kernel(lc: int):
+    key = ("add_sm_multi", lc)
+    k = _KERNELS.get(key)
+    if k is None:
+        k = _KERNELS[key] = mx.fast.metal_kernel(
+            name=f"bv3_mla_add_softmax_multi_{lc}",
+            input_names=[f"qk{i}" for i in range(lc)] + ["pe", "S_base", "pe_stride"],
+            output_names=[f"pr{i}" for i in range(lc)],
+            header=GLUE_HEADER,
+            source=_add_softmax_multi_src(lc),
             ensure_row_contiguous=True,
         )
     return k
@@ -679,6 +784,7 @@ def mla_multilinear_fp8_rows(
     sc_a = _scale_arr(attn_scale, x.dtype) if has_scale else _zero_bf16(x.dtype)
     bsg, b_sub, tm = _ml_cfg(B) if cfg is None else cfg
     nt = N // (4 * tm)
+    gx = min(nt, 8)
     (out,) = _ml_fp8_kernel()(
         inputs=[x, w_fp8, w_sc, gr, sc_a],
         template=[
@@ -695,7 +801,7 @@ def mla_multilinear_fp8_rows(
             ("HAS_GATE", int(has_gate)),
             ("HAS_SCALE", int(has_scale)),
         ],
-        grid=(nt * 32, 4 * bsg, H),
+        grid=(gx * 32, 4 * bsg, H),
         threadgroup=(32, 4 * bsg, 1),
         output_shapes=[(B, N * H) if has_gate else (B, H, 1, N)],
         output_dtypes=[x.dtype],
@@ -797,9 +903,8 @@ def mla_causal_add_softmax_rows(qk: mx.array, pe: mx.array, S_base: int) -> mx.a
     L = L64 // 64
     assert L64 == L * 64 and S_end <= 4096
     n_thr = min(1024, ((S_end + 3) // 4 + 31) // 32 * 32)
-    params = mx.array([S_end, S_base], dtype=mx.int32)
     (pr,) = _causal_add_softmax_kernel()(
-        inputs=[qk, pe, params],
+        inputs=[qk, pe, int(S_end), int(S_base)],
         grid=(n_thr, 1, L64),
         threadgroup=(n_thr, 1, 1),
         output_shapes=[(L, 64, 1, S_end)],
@@ -811,15 +916,30 @@ def mla_causal_add_softmax_rows(qk: mx.array, pe: mx.array, S_base: int) -> mx.a
 def mla_add_softmax_strided_rows(qk_t: mx.array, pe_bat: mx.array, t: int, valid_len: int, pe_stride: int) -> mx.array:
     """Bit-exact single-token fused `(qk_t + pe_bat[t, :, :valid_len])` + `mx.softmax` (`valid_len <= 4096`)."""
     n_thr = min(1024, ((valid_len + 3) // 4 + 31) // 32 * 32)
-    params = mx.array([valid_len, pe_stride, t], dtype=mx.int32)
     (pr,) = _add_softmax_strided_kernel()(
-        inputs=[qk_t.reshape(64, valid_len), pe_bat, params],
+        inputs=[qk_t.reshape(64, valid_len), pe_bat, int(valid_len), int(pe_stride), int(t)],
         grid=(n_thr, 1, 64),
         threadgroup=(n_thr, 1, 1),
         output_shapes=[(1, 64, 1, valid_len)],
         output_dtypes=[mx.bfloat16],
     )
     return pr
+
+
+def mla_add_softmax_multi_rows(qk_list: list[mx.array], pe_bat: mx.array, S_base: int, pe_stride: int) -> list[mx.array]:
+    """Single-launch fused `(qk_t + pe_bat[t])` + exact `softmax_single_row` across `2 <= lc <= 8` tokens."""
+    lc = len(qk_list)
+    S_end = S_base + lc
+    assert 2 <= lc <= 8 and S_end <= 4096
+    n_thr = min(1024, ((S_end + 3) // 4 + 31) // 32 * 32)
+    outs = _add_softmax_multi_kernel(lc)(
+        inputs=[qk_list[t].reshape(64, S_base + t + 1) for t in range(lc)] + [pe_bat, int(S_base), int(pe_stride)],
+        grid=(n_thr, 1, lc * 64),
+        threadgroup=(n_thr, 1, 1),
+        output_shapes=[(1, 64, 1, S_base + t + 1) for t in range(lc)],
+        output_dtypes=[mx.bfloat16] * lc,
+    )
+    return list(outs)
 
 
 def _mla_q_kv_g_and_q_full(
@@ -958,6 +1078,19 @@ def mla_sdpa_verify_rows(
                 end = base_end + t + 1
                 pr_t = mx.softmax(sc_bat[t : t + 1, :, :, :valid_len], axis=-1, precise=True)
                 outs.append(pr_t @ kl_buf[:, :, start_k:end, :])
+        return outs
+
+    if 2 <= lc <= 8 and S_end <= 4096 and qn_c.dtype == mx.bfloat16:
+        qks = []
+        kls_t = []
+        for t in range(lc):
+            end = base_end + t + 1
+            kl_t = kl_buf[:, :, start_k:end, :]
+            kls_t.append(kl_t)
+            qks.append(qn_c[t : t + 1] @ kl_t.swapaxes(-1, -2))
+        prs = mla_add_softmax_multi_rows(qks, pe_bat, S_base, S_end)
+        for t in range(lc):
+            outs.append(prs[t] @ kls_t[t])
         return outs
 
     for t in range(lc):

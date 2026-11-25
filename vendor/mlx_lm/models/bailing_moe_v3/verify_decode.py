@@ -16,6 +16,7 @@ from .rows.gemv_fp8 import (
 )
 from .rows.kda import (
     kda_conv_commit_rows,
+    kda_fused_verify_rows,
     kda_gdn_advance_only,
     kda_gdn_advance_split_only,
     kda_gdn_commit_and_verify_seq_rows,
@@ -33,8 +34,9 @@ from .rows.mla import mla_verify_layer_rows, mla_verify_varlen_rows
 from .rows.moe import moe_down_combine_rows, moe_gate_up_swiglu_rows
 from .rows.router import group_router_dedup_rows, group_router_rows
 
-_VERIFY_FLUSH_EVERY = int(os.environ.get("LINGSANTE_VERIFY_FLUSH", "4"))
+_VERIFY_FLUSH_EVERY = int(os.environ.get("LINGSANTE_VERIFY_FLUSH", "1"))
 _USE_LAZY_KDA = os.environ.get("LINGSANTE_LAZY_KDA", "1") not in ("0", "")
+_USE_FUSED_KDA = os.environ.get("LINGSANTE_FUSED_KDA", "1") not in ("0", "")
 _USE_PARTSS_KDA_IN = os.environ.get("LINGSANTE_PARTSS_KDA_IN", "0") not in ("0", "")
 _KDA_CV_NSG = int(os.environ.get("LINGSANTE_KDA_CV_NSG", "1"))
 
@@ -256,124 +258,166 @@ def _fast_verify_impl(
                     q_r, k_r, v_r, f_r, g_r, b_r = gemv_lin_multi(h_in, qkv_mods)
 
             cs0, cs1, cs2 = c[0], c[1], c[2]
-            if varlen:
-                q, k, v, g, beta = kda_pre_varlen_rows(
-                    q_r,
-                    k_r,
-                    v_r,
-                    f_r,
-                    b_r,
-                    cs0,
-                    cs1,
-                    cs2,
-                    attn.q_conv1d.weight,
-                    attn.k_conv1d.weight,
-                    attn.v_conv1d.weight,
-                    attn.A_log,
-                    attn.dt_bias,
-                    Ls,
-                    lower_bound=attn.lower_bound,
-                    eps=1e-6,
-                    stream_id=stream_id,
-                    step_in_stream=step_in_stream,
-                )
-            else:
-                q, k, v, g, beta = kda_pre_seq_rows(
-                    q_r,
-                    k_r,
-                    v_r,
-                    f_r,
-                    b_r,
-                    cs0,
-                    cs1,
-                    cs2,
-                    attn.q_conv1d.weight,
-                    attn.k_conv1d.weight,
-                    attn.v_conv1d.weight,
-                    attn.A_log,
-                    attn.dt_bias,
-                    C=C,
-                    L=L,
-                    lower_bound=attn.lower_bound,
-                    eps=1e-6,
-                    emit_hist=False,
-                )
-
             lazy_prev = getattr(c, "_lazy_gdn", None)
             is_split = len(c.cache) > 4
-            if lazy_prev is not None:
-                p_s0, p_k, p_v, p_g, p_beta, p_off, p_nc, p_C, p_L, _ = lazy_prev
-                if p_C == C and (isinstance(p_s0, list) == is_split):
-                    c._lazy_gdn = None
-                    p_off_arg = p_off if p_off is not None else mx.array([ci * p_L for ci in range(C)], dtype=mx.int32)
-                    if varlen:
-                        if is_split:
-                            ov, s_comm = kda_gdn_commit_and_verify_varlen_split_rows(
-                                q, k, v, g, beta, p_s0, p_k, p_v, p_g, p_beta, p_off_arg, p_nc,
-                                g_r, attn.o_norm.weight, Ls, eps=attn.o_norm.eps, nsg=_KDA_CV_NSG, write_end=False,
-                                stream_off=stream_off, stream_L=stream_L,
-                            )
-                            for ci in range(C):
-                                c[3 + ci] = s_comm[ci]
-                        else:
-                            ov, s_comm = kda_gdn_commit_and_verify_varlen_rows(
-                                q, k, v, g, beta, p_s0, p_k, p_v, p_g, p_beta, p_off_arg, p_nc,
-                                g_r, attn.o_norm.weight, Ls, eps=attn.o_norm.eps, nsg=_KDA_CV_NSG, write_end=False,
-                                stream_off=stream_off, stream_L=stream_L,
-                            )
-                            c[3] = s_comm
-                    else:
-                        if is_split:
-                            ov, s_comm = kda_gdn_commit_and_verify_seq_split_rows(
-                                q, k, v, g, beta, p_s0, p_k, p_v, p_g, p_beta, p_off_arg, p_nc,
-                                g_r, attn.o_norm.weight, C=C, L=L, eps=attn.o_norm.eps, nsg=_KDA_CV_NSG, write_end=False,
-                            )
-                            for ci in range(C):
-                                c[3 + ci] = s_comm[ci]
-                        else:
-                            ov, s_comm = kda_gdn_commit_and_verify_seq_rows(
-                                q, k, v, g, beta, p_s0, p_k, p_v, p_g, p_beta, p_off_arg, p_nc,
-                                g_r, attn.o_norm.weight, C=C, L=L, eps=attn.o_norm.eps, nsg=_KDA_CV_NSG, write_end=False,
-                            )
-                            c[3] = s_comm
-                    s0 = s_comm
-                    s_end = None
-                else:
-                    materialize_lazy_kda([c])
-                    lazy_prev = None
+            max_l = max(Ls) if varlen else L
+            use_mega = _USE_FUSED_KDA and (1 <= max_l <= 16) and not (is_split and lazy_prev is not None)
 
-            if lazy_prev is None:
-                write_end = not use_lazy_write
-                if is_split:
-                    s0 = list(c.cache[3:])
-                    if varlen:
-                        res_gdn = kda_gdn_verify_varlen_split_rows(
-                            q, k, v, g, beta, s0, g_r, attn.o_norm.weight, Ls,
-                            eps=attn.o_norm.eps, write_end=write_end,
+            if use_mega:
+                if lazy_prev is not None:
+                    p_s0, p_k, p_v, p_g, p_beta, p_off, p_nc, p_C, p_L, _ = lazy_prev
+                    if p_C == C and (isinstance(p_s0, list) == is_split):
+                        c._lazy_gdn = None
+                        p_off_arg = p_off if p_off is not None else mx.array([ci * p_L for ci in range(C)], dtype=mx.int32)
+                        emit_kvgb = bool(return_rollback)
+                        ov, s_comm, s_end, k, v, g, beta = kda_fused_verify_rows(
+                            q_r, k_r, v_r, f_r, g_r, b_r, cs0, cs1, cs2,
+                            attn.q_conv1d.weight, attn.k_conv1d.weight, attn.v_conv1d.weight,
+                            attn.A_log, attn.dt_bias, p_s0, attn.o_norm.weight,
+                            C=C, L=L, Ls=Ls, lower_bound=attn.lower_bound, eps=1e-6, o_eps=attn.o_norm.eps,
+                            write_end=False, emit_kvgb=emit_kvgb,
+                            prev_k=p_k, prev_v=p_v, prev_g=p_g, prev_beta=p_beta, prev_off=p_off_arg, prev_nc=p_nc,
                             stream_off=stream_off, stream_L=stream_L,
                         )
+                        if is_split:
+                            for ci in range(C):
+                                c[3 + ci] = s_comm[ci]
+                        else:
+                            c[3] = s_comm
+                        s0 = s_comm
                     else:
-                        res_gdn = kda_gdn_verify_seq_split_rows(
-                            q, k, v, g, beta, s0, g_r, attn.o_norm.weight,
-                            C=C, L=L, eps=attn.o_norm.eps, write_end=write_end,
-                        )
+                        materialize_lazy_kda([c])
+                        lazy_prev = None
+
+                if lazy_prev is None:
+                    write_end = not use_lazy_write
+                    s0 = list(c.cache[3:]) if is_split else c[3]
+                    emit_kvgb = bool(return_rollback and (use_lazy_write or max_l > 1))
+                    ov, _, s_end, k, v, g, beta = kda_fused_verify_rows(
+                        q_r, k_r, v_r, f_r, g_r, b_r, cs0, cs1, cs2,
+                        attn.q_conv1d.weight, attn.k_conv1d.weight, attn.v_conv1d.weight,
+                        attn.A_log, attn.dt_bias, s0, attn.o_norm.weight,
+                        C=C, L=L, Ls=Ls, lower_bound=attn.lower_bound, eps=1e-6, o_eps=attn.o_norm.eps,
+                        write_end=write_end, emit_kvgb=emit_kvgb,
+                        stream_off=stream_off, stream_L=stream_L,
+                    )
+            else:
+                if varlen:
+                    q, k, v, g, beta = kda_pre_varlen_rows(
+                        q_r,
+                        k_r,
+                        v_r,
+                        f_r,
+                        b_r,
+                        cs0,
+                        cs1,
+                        cs2,
+                        attn.q_conv1d.weight,
+                        attn.k_conv1d.weight,
+                        attn.v_conv1d.weight,
+                        attn.A_log,
+                        attn.dt_bias,
+                        Ls,
+                        lower_bound=attn.lower_bound,
+                        eps=1e-6,
+                        stream_id=stream_id,
+                        step_in_stream=step_in_stream,
+                    )
                 else:
-                    s0 = c[3]
-                    if varlen:
-                        res_gdn = kda_gdn_verify_varlen_rows(
-                            q, k, v, g, beta, s0, g_r, attn.o_norm.weight, Ls,
-                            eps=attn.o_norm.eps, write_end=write_end,
-                            stream_off=stream_off, stream_L=stream_L,
-                        )
+                    q, k, v, g, beta = kda_pre_seq_rows(
+                        q_r,
+                        k_r,
+                        v_r,
+                        f_r,
+                        b_r,
+                        cs0,
+                        cs1,
+                        cs2,
+                        attn.q_conv1d.weight,
+                        attn.k_conv1d.weight,
+                        attn.v_conv1d.weight,
+                        attn.A_log,
+                        attn.dt_bias,
+                        C=C,
+                        L=L,
+                        lower_bound=attn.lower_bound,
+                        eps=1e-6,
+                        emit_hist=False,
+                    )
+
+                if lazy_prev is not None:
+                    p_s0, p_k, p_v, p_g, p_beta, p_off, p_nc, p_C, p_L, _ = lazy_prev
+                    if p_C == C and (isinstance(p_s0, list) == is_split):
+                        c._lazy_gdn = None
+                        p_off_arg = p_off if p_off is not None else mx.array([ci * p_L for ci in range(C)], dtype=mx.int32)
+                        if varlen:
+                            if is_split:
+                                ov, s_comm = kda_gdn_commit_and_verify_varlen_split_rows(
+                                    q, k, v, g, beta, p_s0, p_k, p_v, p_g, p_beta, p_off_arg, p_nc,
+                                    g_r, attn.o_norm.weight, Ls, eps=attn.o_norm.eps, nsg=_KDA_CV_NSG, write_end=False,
+                                    stream_off=stream_off, stream_L=stream_L,
+                                )
+                                for ci in range(C):
+                                    c[3 + ci] = s_comm[ci]
+                            else:
+                                ov, s_comm = kda_gdn_commit_and_verify_varlen_rows(
+                                    q, k, v, g, beta, p_s0, p_k, p_v, p_g, p_beta, p_off_arg, p_nc,
+                                    g_r, attn.o_norm.weight, Ls, eps=attn.o_norm.eps, nsg=_KDA_CV_NSG, write_end=False,
+                                    stream_off=stream_off, stream_L=stream_L,
+                                )
+                                c[3] = s_comm
+                        else:
+                            if is_split:
+                                ov, s_comm = kda_gdn_commit_and_verify_seq_split_rows(
+                                    q, k, v, g, beta, p_s0, p_k, p_v, p_g, p_beta, p_off_arg, p_nc,
+                                    g_r, attn.o_norm.weight, C=C, L=L, eps=attn.o_norm.eps, nsg=_KDA_CV_NSG, write_end=False,
+                                )
+                                for ci in range(C):
+                                    c[3 + ci] = s_comm[ci]
+                            else:
+                                ov, s_comm = kda_gdn_commit_and_verify_seq_rows(
+                                    q, k, v, g, beta, p_s0, p_k, p_v, p_g, p_beta, p_off_arg, p_nc,
+                                    g_r, attn.o_norm.weight, C=C, L=L, eps=attn.o_norm.eps, nsg=_KDA_CV_NSG, write_end=False,
+                                )
+                                c[3] = s_comm
+                        s0 = s_comm
+                        s_end = None
                     else:
-                        res_gdn = kda_gdn_verify_seq_rows(
-                            q, k, v, g, beta, s0, g_r, attn.o_norm.weight,
-                            C=C, L=L, eps=attn.o_norm.eps, write_end=write_end,
-                        )
-                if write_end:
-                    ov, s_end = res_gdn
-                else:
-                    ov, s_end = res_gdn, None
+                        materialize_lazy_kda([c])
+                        lazy_prev = None
+
+                if lazy_prev is None:
+                    write_end = not use_lazy_write
+                    if is_split:
+                        s0 = list(c.cache[3:])
+                        if varlen:
+                            res_gdn = kda_gdn_verify_varlen_split_rows(
+                                q, k, v, g, beta, s0, g_r, attn.o_norm.weight, Ls,
+                                eps=attn.o_norm.eps, write_end=write_end,
+                                stream_off=stream_off, stream_L=stream_L,
+                            )
+                        else:
+                            res_gdn = kda_gdn_verify_seq_split_rows(
+                                q, k, v, g, beta, s0, g_r, attn.o_norm.weight,
+                                C=C, L=L, eps=attn.o_norm.eps, write_end=write_end,
+                            )
+                    else:
+                        s0 = c[3]
+                        if varlen:
+                            res_gdn = kda_gdn_verify_varlen_rows(
+                                q, k, v, g, beta, s0, g_r, attn.o_norm.weight, Ls,
+                                eps=attn.o_norm.eps, write_end=write_end,
+                                stream_off=stream_off, stream_L=stream_L,
+                            )
+                        else:
+                            res_gdn = kda_gdn_verify_seq_rows(
+                                q, k, v, g, beta, s0, g_r, attn.o_norm.weight,
+                                C=C, L=L, eps=attn.o_norm.eps, write_end=write_end,
+                            )
+                    if write_end:
+                        ov, s_end = res_gdn
+                    else:
+                        ov, s_end = res_gdn, None
 
             if return_rollback:
                 kda_records.append((c, s0, s_end, q_r, k_r, v_r, k, v, g, beta, cs0, cs1, cs2))
