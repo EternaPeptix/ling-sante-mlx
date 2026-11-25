@@ -11,8 +11,32 @@ class SuffixMatcher:
         self.max_history = max_history
         self.tokens: list[int] = []
         self._index: dict[tuple[int, ...], list[int]] = {}
+        # Online decayed acceptance guard (Bayesian Beta(2, 1) prior -> starts ~0.67)
+        self._acc_num: float = 2.0
+        self._acc_den: float = 3.0
         if tokens:
             self.extend(tokens)
+
+    @property
+    def accept_rate(self) -> float:
+        return self._acc_num / max(1e-6, self._acc_den)
+
+    def observe_outcome(self, n_accepted_tail: int, n_proposed_tail: int) -> None:
+        """Update online acceptance EMA for suffix tail tokens (tokens beyond d0)."""
+        if n_proposed_tail <= 0:
+            return
+        decay = 0.85
+        self._acc_num = self._acc_num * decay + float(n_accepted_tail)
+        self._acc_den = self._acc_den * decay + float(n_proposed_tail)
+
+    def effective_min_gram(self, base_min_gram: int) -> int:
+        """Relax to base_min_gram when online acceptance is healthy; tighten automatically on misses."""
+        r = self.accept_rate
+        if r >= 0.55:
+            return base_min_gram
+        if r >= 0.35:
+            return max(base_min_gram, 5)
+        return max(base_min_gram, 7)
 
     def _index_pos(self, pos: int):
         # Record all n-grams ending strictly before `pos`, i.e., tokens[pos - n : pos] -> pos.
@@ -28,11 +52,14 @@ class SuffixMatcher:
                     del locs[:-4]
 
     def extend(self, new_tokens: Sequence[int]):
+        if not new_tokens:
+            return
         start = len(self.tokens)
         self.tokens.extend(int(t) for t in new_tokens)
         if len(self.tokens) > self.max_history and start == 0:
             self.tokens = self.tokens[-self.max_history :]
-        for pos in range(max(self.min_gram, start), len(self.tokens) + 1):
+        begin = self.min_gram if start == 0 else max(self.min_gram, start + 1)
+        for pos in range(begin, len(self.tokens) + 1):
             self._index_pos(pos)
 
     def match(self, max_len: int, *, min_gram: int | None = None, tail_extra: Sequence[int] = (), first_token: int | None = None) -> tuple[int, list[int]]:

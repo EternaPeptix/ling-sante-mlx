@@ -410,13 +410,14 @@ def generate_step(
         and getattr(model, "_lingsante_mtp_holder", None) is not None
     ):
         from .models.bailing_moe_v3.spec_engine import (
+            extract_sampling_spec,
             get_lingsante_mtp,
             is_greedy_sampler,
             mtp_generate_step,
         )
 
-        if (mtp := get_lingsante_mtp(model)) is not None and is_greedy_sampler(
-            sampler
+        if (mtp := get_lingsante_mtp(model)) is not None and (
+            is_greedy_sampler(sampler) or extract_sampling_spec(sampler) is not None
         ):
             yield from mtp_generate_step(
                 prompt,
@@ -427,6 +428,7 @@ def generate_step(
                 prompt_cache=prompt_cache,
                 prefill_step_size=prefill_step_size,
                 prompt_progress_callback=prompt_progress_callback,
+                sampler=sampler,
             )
             return
 
@@ -1268,6 +1270,28 @@ class PromptProcessingBatch:
 
     def split(self, indices: List[int]):
         indices = sorted(indices)
+        if len(indices) == len(self.uids):
+            new_batch = self.__class__.__new__(self.__class__)
+            new_batch.model = self.model
+            new_batch.uids = self.uids
+            new_batch.prompt_cache = self.prompt_cache
+            new_batch.tokens = self.tokens
+            new_batch._mtp_states = self._mtp_states
+            new_batch.prefill_step_size = self.prefill_step_size
+            new_batch.samplers = self.samplers
+            new_batch.fallback_sampler = self.fallback_sampler
+            new_batch.logits_processors = self.logits_processors
+            new_batch.stop_sequences = self.stop_sequences
+            new_batch.max_tokens = self.max_tokens
+            self.uids = []
+            self.prompt_cache = []
+            self.tokens = []
+            self._mtp_states = []
+            self.samplers = []
+            self.logits_processors = []
+            self.max_tokens = []
+            self.stop_sequences = []
+            return new_batch
         indices_left = sorted(set(range(len(self.uids))) - set(indices))
         new_batch = self._copy()
         self.filter(indices_left)
@@ -1347,11 +1371,15 @@ class PromptProcessingBatch:
                     mtp, chunk, h, self._mtp_states[0]
                 )
             else:
-                self.model(chunk, cache=self.prompt_cache)
+                if hasattr(self.model, "model"):
+                    self.model.model(chunk, cache=self.prompt_cache)
+                else:
+                    self.model(chunk, cache=self.prompt_cache)
                 mx.eval([c.state for c in self.prompt_cache])
                 if self._mtp_states:
                     self._mtp_states = [None] * len(self.uids)
-            mx.clear_cache()
+            if n_to_process >= 512:
+                mx.clear_cache()
             tokens = tokens[:, n_to_process:]
 
         # Finalize the cache if there was any padding
@@ -1359,7 +1387,8 @@ class PromptProcessingBatch:
             for c in self.prompt_cache:
                 c.finalize()
             mx.eval([c.state for c in self.prompt_cache])
-            mx.clear_cache()
+            if max_length >= 512:
+                mx.clear_cache()
 
     def generate(self, tokens: List[List[int]]):
         """
@@ -1494,7 +1523,15 @@ class GenerationBatch:
                     )
                 ):
                     self._spec = LingSanteSpecBatch.init_from_prompt(
-                        self.model, mtp, inputs, self.prompt_cache, mtp_states
+                        self.model,
+                        mtp,
+                        inputs,
+                        self.prompt_cache,
+                        mtp_states,
+                        samplers=self.samplers,
+                        fallback_sampler=self.fallback_sampler,
+                        logits_processors=self.logits_processors,
+                        token_contexts=self._token_context,
                     )
                     for sti, ti in zip(self.tokens, inputs.tolist()):
                         sti.append(ti)
@@ -1584,6 +1621,27 @@ class GenerationBatch:
             self._token_context.extend(batch._token_context)
             self._num_tokens.extend(batch._num_tokens)
             self._matchers.extend(batch._matchers)
+            return
+
+        # Mixed greedy + non-greedy coexistence in varlen spec mode: absorb a
+        # non-greedy batch (K_i=0, L_i=1) without collapsing active greedy peers.
+        if (
+            self._spec is not None
+            and batch._spec is None
+            and (len(self.uids) + len(batch.uids)) <= 4
+            and self._spec.can_absorb_nongreedy(batch)
+        ):
+            self._spec.absorb_nongreedy(batch)
+            self.uids.extend(batch.uids)
+            self.tokens.extend(batch.tokens)
+            self.samplers.extend(batch.samplers)
+            self.logits_processors.extend(batch.logits_processors)
+            self.max_tokens.extend(batch.max_tokens)
+            self.stop_sequences.extend(batch.stop_sequences)
+            self._token_context.extend(batch._token_context)
+            self._num_tokens.extend(batch._num_tokens)
+            self._matchers.extend(batch._matchers)
+            batch.prompt_cache = []
             return
 
         if self._spec is not None:
@@ -2059,6 +2117,45 @@ class BatchGenerator:
             max_tokens=max_tokens,
         )
 
+    def refresh_queued_caches(self, fetch_fn, on_hit=None) -> int:
+        """Re-check prompt cache for queued sequences not yet started (in-flight prefix coalescing)."""
+        hits = 0
+        if not self._unprocessed_sequences:
+            return hits
+        updated = deque()
+        for entry in self._unprocessed_sequences:
+            uid, segs, m, c, at, s, lp, sm = entry
+            full_prompt = list(at)
+            for seg in segs:
+                full_prompt.extend(seg)
+            new_cache, rest = fetch_fn(full_prompt)
+            new_hit = len(full_prompt) - len(rest)
+            if new_cache is not None and new_hit > len(at) and new_hit < len(full_prompt):
+                delta = new_hit - len(at)
+                new_segs = [list(seg) for seg in segs]
+                popped_segs = 0
+                while delta > 0 and new_segs:
+                    if delta >= len(new_segs[0]):
+                        delta -= len(new_segs.pop(0))
+                        popped_segs += 1
+                    else:
+                        new_segs[0] = new_segs[0][delta:]
+                        delta = 0
+                if new_segs:
+                    if len(new_segs[-1]) != 1:
+                        new_segs.append(new_segs[-1][-1:])
+                        new_segs[-2] = new_segs[-2][:-1]
+                    updated.append(
+                        (uid, new_segs, m, new_cache, full_prompt[:new_hit], s, lp, sm)
+                    )
+                    hits += 1
+                    if on_hit is not None:
+                        on_hit(uid, new_hit, popped_segs)
+                    continue
+            updated.append(entry)
+        self._unprocessed_sequences = updated
+        return hits
+
     def _next(self):
         generation_responses = []
         prompt_responses = []
@@ -2066,9 +2163,21 @@ class BatchGenerator:
         # Generate tokens first
         if len(self._generation_batch) > 0:
             tic = time.perf_counter()
-            prefetch = len(self._generation_batch) >= self.completion_batch_size or (
-                not self._unprocessed_sequences and not self._currently_processing
-            )
+            will_join_now = False
+            if len(self._generation_batch) < self.completion_batch_size:
+                for seq in self._currently_processing:
+                    if len(seq[0]) == 1 and len(seq[0][0]) == 1:
+                        will_join_now = True
+                        break
+                if (
+                    not will_join_now
+                    and not self._currently_processing
+                    and self._unprocessed_sequences
+                ):
+                    seq0 = self._unprocessed_sequences[0][1]
+                    if len(seq0) == 1 and len(seq0[0]) == 1:
+                        will_join_now = True
+            prefetch = not will_join_now
             generation_responses = self._generation_batch.next(prefetch=prefetch)
             self._counters.decode_time += time.perf_counter() - tic
             self._counters.generation_tokens += len(generation_responses)
@@ -2104,17 +2213,35 @@ class BatchGenerator:
             last_inputs = [self._currently_processing[i][0][0] for i in split]
             progress = [(self._currently_processing[i][2],) * 2 for i in split]
             self._currently_processing = [self._currently_processing[i] for i in keep]
-            gen_batch = self._prompt_batch.split(split).generate(last_inputs)
-            for i, p in enumerate(progress):
-                prompt_responses.append(
-                    PromptProcessingBatch.Response(
-                        gen_batch.uids[i],
-                        p,
-                        True,
-                        True,
+            split_pb = self._prompt_batch.split(split)
+            spec = self._generation_batch._spec
+            if (
+                spec is not None
+                and len(self._generation_batch) + len(split_pb) <= 4
+                and spec.can_piggyback_join(split_pb, last_inputs)
+            ):
+                spec.piggyback_join(self._generation_batch, split_pb, last_inputs)
+                for i, p in enumerate(progress):
+                    prompt_responses.append(
+                        PromptProcessingBatch.Response(
+                            split_pb.uids[i],
+                            p,
+                            True,
+                            True,
+                        )
                     )
-                )
-            self._generation_batch.extend(gen_batch)
+            else:
+                gen_batch = split_pb.generate(last_inputs)
+                for i, p in enumerate(progress):
+                    prompt_responses.append(
+                        PromptProcessingBatch.Response(
+                            gen_batch.uids[i],
+                            p,
+                            True,
+                            True,
+                        )
+                    )
+                self._generation_batch.extend(gen_batch)
 
         # Extract the next prompts input
         prompts = []
