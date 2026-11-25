@@ -348,6 +348,123 @@ def _make_gated_delta_packed_kernel():
     )
 
 
+def _make_gated_delta_packed_vec_kernel():
+    """Bit-exact zero-TG packed 8-rows/sg vector-gate (g.ndim==4, Dk=128) prefill kernel.
+
+    Uses the exact ascending butterfly (4-elem chains -> pairwise local tree -> shuffle_xor 1, 2)
+    matching Apple GPU simd_sum in `_make_gated_delta_kernel(vectorized=True)`, with zero
+    threadgroup memory / zero barriers (threadgroup=(32, 1, 1) -> 1024 TGs at Dv=128, Hv=64)
+    and 8x float4 (128-bit) state I/O + 4-wide vectorized q/k/g loads.
+    """
+    if not mx.metal.is_available():
+        return None
+
+    source = r"""
+        constexpr int lanes_per_row = 4;
+        constexpr int rows_per_simdgroup = 32 / lanes_per_row;  // 8
+        constexpr int values_per_lane = Dk / lanes_per_row;     // 32
+        constexpr int partials_per_lane = values_per_lane / 4;  // 8
+
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+
+        auto lane = thread_index_in_simdgroup;
+        auto row_in_simdgroup = lane / lanes_per_row;
+        auto lane_in_row = lane & (lanes_per_row - 1);
+        auto row_group = thread_position_in_grid.y;
+        auto dv_idx = row_group * rows_per_simdgroup + row_in_simdgroup;
+        auto k_base = lane_in_row * values_per_lane;
+
+        // q, k: [B, T, Hk, Dk]; v, y: [B, T, Hv, Dv]; g: [B, T, Hv, Dk]
+        auto q_base = q + (b_idx * T * Hk + hk_idx) * Dk + k_base;
+        auto k_head = k + (b_idx * T * Hk + hk_idx) * Dk + k_base;
+        auto v_base = v + (b_idx * T * Hv + hv_idx) * Dv + dv_idx;
+        auto y_base = y + (b_idx * T * Hv + hv_idx) * Dv + dv_idx;
+        auto g_base = g + (b_idx * T * Hv + hv_idx) * Dk + k_base;
+        auto beta_base = beta + b_idx * T * Hv + hv_idx;
+
+        // state_in, state_out: [B, Hv, Dv, Dk] (128B aligned per lane_in_row)
+        const size_t st_off = (size_t(n) * Dv + dv_idx) * Dk + k_base;
+        const device float4* i_state4 = (const device float4*)(state_in + st_off);
+        device float4* o_state4 = (device float4*)(state_out + st_off);
+
+        float4 state[partials_per_lane];
+#pragma unroll
+        for (int pb = 0; pb < partials_per_lane; ++pb) {
+          state[pb] = i_state4[pb];
+        }
+
+        const size_t qk_stride = size_t(Hk) * Dk;
+        const size_t vy_stride = size_t(Hv) * Dv;
+        const size_t g_stride = size_t(Hv) * Dk;
+
+        for (int t = 0; t < T; ++t) {
+          const device vec<InT, 4>* k4p = (const device vec<InT, 4>*)(k_head + size_t(t) * qk_stride);
+          const device vec<InT, 4>* q4p = (const device vec<InT, 4>*)(q_base + size_t(t) * qk_stride);
+          const device float4* g4p = (const device float4*)(g_base + size_t(t) * g_stride);
+
+          float part[partials_per_lane];
+#pragma unroll
+          for (int pb = 0; pb < partials_per_lane; ++pb) {
+            float4 g4 = g4p[pb];
+            float4 k4 = static_cast<float4>(k4p[pb]);
+            float4 s4 = state[pb] * g4;
+            state[pb] = s4;
+            float acc = 0.0f;
+            acc += s4.x * k4.x;
+            acc += s4.y * k4.y;
+            acc += s4.z * k4.z;
+            acc += s4.w * k4.w;
+            part[pb] = acc;
+          }
+          float kv_mem =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          kv_mem += simd_shuffle_xor(kv_mem, 1);
+          kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+          float delta =
+              (static_cast<float>(v_base[size_t(t) * vy_stride]) - kv_mem) *
+              static_cast<float>(beta_base[size_t(t) * Hv]);
+
+#pragma unroll
+          for (int pb = 0; pb < partials_per_lane; ++pb) {
+            float4 k4 = static_cast<float4>(k4p[pb]);
+            float4 q4 = static_cast<float4>(q4p[pb]);
+            float4 s4 = state[pb] + k4 * delta;
+            state[pb] = s4;
+            float acc = 0.0f;
+            acc += s4.x * q4.x;
+            acc += s4.y * q4.y;
+            acc += s4.z * q4.z;
+            acc += s4.w * q4.w;
+            part[pb] = acc;
+          }
+          float out_v =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          out_v += simd_shuffle_xor(out_v, 1);
+          out_v += simd_shuffle_xor(out_v, 2);
+          if (lane_in_row == 0) {
+            y_base[size_t(t) * vy_stride] = static_cast<InT>(out_v);
+          }
+        }
+
+#pragma unroll
+        for (int pb = 0; pb < partials_per_lane; ++pb) {
+          o_state4[pb] = state[pb];
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="gated_delta_step_packed_vec_btree",
+        input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
 _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
@@ -356,6 +473,7 @@ _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
 )
 _gated_delta_kernel_xtree = _make_gated_delta_kernel_xtree()
 _gated_delta_kernel_packed = _make_gated_delta_packed_kernel()
+_gated_delta_kernel_packed_vec = _make_gated_delta_packed_vec_kernel()
 
 
 def _gated_delta_kernel_impl(
@@ -377,10 +495,17 @@ def _gated_delta_kernel_impl(
     # The packed kernel gives each lane Dk/4 state elements and packs 32/4
     # value rows into a SIMD-group, so it needs Dk == 128 and Dv divisible by
     # 8. It is otherwise generic in B, Hk, Hv and the input element type.
-    # Vector gating and padding masks keep the original kernels untouched.
     packed_eligible = (
         mask is None
         and g.ndim == 3
+        and Dk == 128
+        and Dv % 8 == 0
+        and g.dtype == mx.float32
+        and state.dtype == mx.float32
+    )
+    packed_vec_eligible = (
+        mask is None
+        and g.ndim == 4
         and Dk == 128
         and Dv % 8 == 0
         and g.dtype == mx.float32
@@ -392,6 +517,11 @@ def _gated_delta_kernel_impl(
         inputs = [q, k, v, g, beta, state, T]
         grid = (32, Dv // 8, B * Hv)
         threadgroup = (32, 2, 1)
+    elif packed_vec_eligible and allow_packed and _ENABLE_GDN_PACKED:
+        kernel = _gated_delta_kernel_packed_vec
+        inputs = [q, k, v, g, beta, state, T]
+        grid = (32, Dv // 8, B * Hv)
+        threadgroup = (32, 1, 1)
     elif g.ndim == 4:
         kernel = _gated_delta_kernel_vec
         inputs = [q, k, v, g, beta, state, T]

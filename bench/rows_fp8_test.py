@@ -17,17 +17,24 @@ from mlx_lm.models.bailing_moe_v3.rows.gemv import (  # noqa: E402
     gemv_rows_multi,
     gemv_rows_res,
     gemv_swiglu_rows,
+    router_gemv_rows,
 )
 from mlx_lm.models.bailing_moe_v3.rows.gemv_fp8 import (  # noqa: E402
     dequant_fp8_multilinear_to_bf16,
     dequant_fp8_to_bf16,
     gemv_fp8_rows,
     gemv_fp8_rows_group,
+    gemv_fp8_rows_res,
     gemv_fp8_swiglu_rows,
+    gemv_fp8_with_bf16_tail_rows,
+    gemv_kda_qkvfgb_merged_rows,
     gemv_lin,
     gemv_lin_multi,
     gemv_lin_res,
     gemv_lin_swiglu,
+    gemv_router_se_swiglu_rows,
+    pack_fp8_k_major,
+    pack_qkvfg_fp8,
 )
 from mlx_lm.models.bailing_moe_v3.rows.mla import mla_multilinear_fp8_rows, mla_multilinear_lin, mla_multilinear_rows  # noqa: E402
 
@@ -171,9 +178,108 @@ def test_gemv_exactness(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head):
         )
         ok &= check(f"dense.down_res B={B}", gemv_lin_res(xd, m0f.down_proj, x4), gemv_rows_res(xd, m0b.down_proj.weight, x4))
 
-        # Check BF16 lm_head against B=1 MLX ref (verifies BSG spill fix at B>=13)
+        # Check BF16 lm_head against B=1 MLX ref (verifies BSG=1 + tg_acc fix at B>=13)
         ref_lh = mx.concatenate([lm_head(x4[b : b + 1]) for b in range(B)], axis=0)
         ok &= check(f"lm_head(bf16) B={B}", gemv_lin(x4, lm_head), ref_lh)
+
+        # Check router_gemv_rows (ntg=256) and fused gemv_router_se_swiglu_rows
+        ref_rtr = mx.concatenate(
+            [x4[b : b + 1].astype(mx.float32) @ l4_bf.mlp.gate.weight.astype(mx.float32).T for b in range(B)], axis=0
+        )
+        ok &= check(f"router_gemv(ntg256) B={B}", router_gemv_rows(x4, l4_bf.mlp.gate.weight), ref_rtr)
+        f_rtr, f_se = gemv_router_se_swiglu_rows(x4, l4_fp8.mlp.gate.weight, se_f.gate_proj, se_f.up_proj)
+        ref_se = gemv_swiglu_rows(x4, se_b.gate_proj.weight, se_b.up_proj.weight)
+        ok &= check(f"fused.router B={B}", f_rtr, ref_rtr)
+        ok &= check(f"fused.se_swiglu B={B}", f_se, ref_se)
+    return ok
+
+
+def test_part_ss_and_repack(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8):
+    print("\n=== 2b. T6 part_ss Parity (vs mx.fast.rms_norm) & T3 Repacking Exactness ===", flush=True)
+    ok = True
+    mx.random.seed(41)
+    a4f, a7f = l4_fp8.attention, l7_fp8.attention
+    se_f = l4_fp8.mlp.shared_experts
+    m0f = l0_fp8.mlp
+    w_norm4 = l4_fp8.post_attention_layernorm.weight
+    eps4 = l4_fp8.post_attention_layernorm.eps
+    w_norm_qa = a7f.q_a_layernorm.weight
+    eps_qa = a7f.q_a_layernorm.eps
+
+    # T3 K-major & merged qkvfg packing exactness
+    qkv_mods = [a4f.q_proj, a4f.k_proj, a4f.v_proj, a4f.f_proj, a4f.g_proj]
+    w_km_o = pack_fp8_k_major(a4f.o_proj.weight_fp8)
+    w_qkv_cat, s_qkv_cat = pack_qkvfg_fp8(qkv_mods, k_major=False)
+    w_qkv_km, s_qkv_km = pack_qkvfg_fp8(qkv_mods, k_major=True)
+    mx.eval(w_km_o, w_qkv_cat, s_qkv_cat, w_qkv_km, s_qkv_km)
+    ok &= check("T3.dequant.o_proj_km", dequant_fp8_to_bf16(w_km_o, a4f.o_proj.weight_scale_inv, k_major=True), l4_bf.attention.o_proj.weight)
+
+    for B in (1, 2, 4, 5, 6, 8, 9, 12, 16):
+        x4 = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
+        x8 = (mx.random.normal((B, 8192)) * 0.25).astype(mx.bfloat16)
+        xd = (mx.random.normal((B, 10240)) * 0.25).astype(mx.bfloat16)
+        mx.eval(x4, x8, xd)
+
+        # 1) FP8 o_proj_res -> part_ss -> fused router + se_swiglu (N=4096, TM=2 -> P=512 or P=1024)
+        h_post, pss = gemv_lin_res(x8, a4f.o_proj, x4, return_part_ss=True)
+        h_ref = gemv_lin_res(x8, a4f.o_proj, x4)
+        ok &= check(f"T6.o_proj_res.h B={B}", h_post, h_ref)
+        mlp_in_ref = mx.fast.rms_norm(h_ref, w_norm4, eps4)
+        ref_rtr, ref_se = gemv_router_se_swiglu_rows(mlp_in_ref, l4_fp8.mlp.gate.weight, se_f.gate_proj, se_f.up_proj)
+        got_rtr, got_se = gemv_router_se_swiglu_rows(
+            h_post, l4_fp8.mlp.gate.weight, se_f.gate_proj, se_f.up_proj, part_ss=pss, norm_w=w_norm4, norm_eps=eps4
+        )
+        ok &= check(f"T6.post_attn->router B={B}", got_rtr, ref_rtr)
+        ok &= check(f"T6.post_attn->se_sw B={B}", got_se, ref_se)
+
+        # 2) FP8 q_a_proj (N=1536) -> part_ss -> q_b_proj
+        qa_out, pss_qa = gemv_lin(x4, a7f.q_a_proj, return_part_ss=True)
+        qa_norm_ref = mx.fast.rms_norm(qa_out, w_norm_qa, eps_qa)
+        ok &= check(
+            f"T6.q_a->q_b B={B}",
+            gemv_lin(qa_out, a7f.q_b_proj, part_ss=pss_qa, norm_w=w_norm_qa, norm_eps=eps_qa),
+            gemv_lin(qa_norm_ref, a7f.q_b_proj),
+        )
+
+        # 3) FP8 dense.down_res -> part_ss -> KDA qkvfgb
+        x_dn, pss_dn = gemv_lin_res(xd, m0f.down_proj, x4, return_part_ss=True)
+        x_dn_norm = mx.fast.rms_norm(x_dn, l4_fp8.input_layernorm.weight, l4_fp8.input_layernorm.eps)
+        kda_pf = [a4f.q_proj, a4f.k_proj, a4f.v_proj, a4f.f_proj, a4f.g_proj, a4f.b_proj]
+        ref_kda = gemv_lin_multi(x_dn_norm, kda_pf)
+        got_kda = gemv_lin_multi(
+            x_dn, kda_pf, part_ss=pss_dn, norm_w=l4_fp8.input_layernorm.weight, norm_eps=l4_fp8.input_layernorm.eps
+        )
+        for nm, g, r in zip(("q", "k", "v", "f", "g", "b"), got_kda, ref_kda):
+            ok &= check(f"T6.dn->kda.{nm} B={B}", g, r)
+
+        # 4) BF16 producer return_part_ss (TM=4 at B<=4, TM=2 at B>=5) -> router_gemv_rows
+        h_bf, pss_bf = gemv_rows_res(x8, l4_bf.attention.o_proj.weight, x4, return_part_ss=True)
+        ok &= check(
+            f"T6.bf16->router B={B}",
+            router_gemv_rows(h_bf, l4_bf.mlp.gate.weight, part_ss=pss_bf, norm_w=w_norm4, norm_eps=eps4),
+            router_gemv_rows(mx.fast.rms_norm(h_bf, w_norm4, eps4), l4_bf.mlp.gate.weight),
+        )
+
+        # 5) T3 K-major & merged qkvfg exactness
+        ok &= check(
+            f"T3.o_proj_km B={B}",
+            gemv_fp8_rows_res(x8, w_km_o, a4f.o_proj.weight_scale_inv, x4, k_major=True),
+            h_ref,
+        )
+        ref_qkvb = gemv_lin_multi(x4, kda_pf)
+        m_outs = gemv_kda_qkvfgb_merged_rows(x4, w_qkv_cat, s_qkv_cat, a4f.b_proj.weight)
+        for nm, g, r in zip(("q", "k", "v", "f", "g", "b"), m_outs, ref_qkvb):
+            ok &= check(f"T3.kda_merged.{nm} B={B}", g, r)
+        m_pss_outs = gemv_kda_qkvfgb_merged_rows(
+            x_dn, w_qkv_cat, s_qkv_cat, a4f.b_proj.weight,
+            part_ss=pss_dn, norm_w=l4_fp8.input_layernorm.weight, norm_eps=l4_fp8.input_layernorm.eps
+        )
+        for nm, g, r in zip(("q", "k", "v", "f", "g", "b"), m_pss_outs, ref_kda):
+            ok &= check(f"T3+T6.kda_merged.{nm} B={B}", g, r)
+        km_out, km_b = gemv_fp8_with_bf16_tail_rows(x4, [w_qkv_km], [s_qkv_km], a4f.b_proj.weight, k_major=True)
+        ref_cat = mx.concatenate(ref_qkvb[:5], axis=-1)
+        ok &= check(f"T3.qkv_km B={B}", km_out, ref_cat)
+        ok &= check(f"T3.qkv_km_b B={B}", km_b, ref_qkvb[5])
     return ok
 
 
@@ -186,33 +292,37 @@ def bench_and_tune(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head):
     w_qkv_bf = [a4b.q_proj.weight, a4b.k_proj.weight, a4b.v_proj.weight, a4b.f_proj.weight, a4b.g_proj.weight]
     w_qkv_f8 = [a4f.q_proj.weight_fp8, a4f.k_proj.weight_fp8, a4f.v_proj.weight_fp8, a4f.f_proj.weight_fp8, a4f.g_proj.weight_fp8]
     s_qkv_f8 = [a4f.q_proj.weight_scale_inv, a4f.k_proj.weight_scale_inv, a4f.v_proj.weight_scale_inv, a4f.f_proj.weight_scale_inv, a4f.g_proj.weight_scale_inv]
+    kda_pf = [a4f.q_proj, a4f.k_proj, a4f.v_proj, a4f.f_proj, a4f.g_proj, a4f.b_proj]
+    w_qkv_cat, s_qkv_cat = pack_qkvfg_fp8(kda_pf[:5], k_major=False)
+    w_qkv_km, s_qkv_km = pack_qkvfg_fp8(kda_pf[:5], k_major=True)
+    w_o_km = pack_fp8_k_major(a4f.o_proj.weight_fp8)
+    mx.eval(w_qkv_cat, s_qkv_cat, w_qkv_km, s_qkv_km, w_o_km)
     bytes_qkv_f8 = 5 * 8192 * 4096
 
-    for B in (1, 5, 8, 12, 16, 20, 24):
+    for B in (1, 5, 6, 8, 9, 12, 16, 20, 24):
         x4 = (mx.random.normal((B, 4096)) * 0.25).astype(mx.bfloat16)
         x8 = (mx.random.normal((B, 8192)) * 0.25).astype(mx.bfloat16)
         qa = (mx.random.normal((B, 1536)) * 0.25).astype(mx.bfloat16)
         mx.eval(x4, x8, qa)
 
-        t_qkv_bf = pipe_ms(lambda: gemv_rows_multi(x4, w_qkv_bf))
         t_qkv_f8 = pipe_ms(lambda: gemv_fp8_rows_group([x4] * 5, w_qkv_f8, s_qkv_f8))
+        t_qkvb = pipe_ms(lambda: gemv_lin_multi(x4, kda_pf))
+        t_qkv_m = pipe_ms(lambda: gemv_kda_qkvfgb_merged_rows(x4, w_qkv_cat, s_qkv_cat, a4f.b_proj.weight))
         gb_s = (bytes_qkv_f8 / 1e9) / (t_qkv_f8 / 1e3)
 
-        t_op_bf = pipe_ms(lambda: gemv_rows_res(x8, a4b.o_proj.weight, x4))
         t_op_f8 = pipe_ms(lambda: gemv_lin_res(x8, a4f.o_proj, x4))
-
-        t_den_bf = pipe_ms(lambda: gemv_swiglu_rows(x4, m0b.gate_proj.weight, m0b.up_proj.weight))
+        t_op_pss = pipe_ms(lambda: gemv_lin_res(x8, a4f.o_proj, x4, return_part_ss=True))
         t_den_f8 = pipe_ms(lambda: gemv_lin_swiglu(x4, m0f.gate_proj, m0f.up_proj))
-
-        t_sh_bf = pipe_ms(lambda: gemv_swiglu_rows(x4, se_b.gate_proj.weight, se_b.up_proj.weight))
         t_sh_f8 = pipe_ms(lambda: gemv_lin_swiglu(x4, se_f.gate_proj, se_f.up_proj))
-
+        t_rtr = pipe_ms(lambda: router_gemv_rows(x4, l4_fp8.mlp.gate.weight))
+        t_rtr_se = pipe_ms(lambda: gemv_router_se_swiglu_rows(x4, l4_fp8.mlp.gate.weight, se_f.gate_proj, se_f.up_proj))
         t_lh = pipe_ms(lambda: gemv_lin(x4, lm_head))
 
         print(
-            f"  B={B:2d}: qkv5 bf16={t_qkv_bf*1000:5.0f}us -> fp8={t_qkv_f8*1000:5.0f}us ({gb_s:5.1f} GB/s, x63={t_qkv_f8*63:4.1f}ms) | "
-            f"o_proj {t_op_bf*1000:4.0f}->{t_op_f8*1000:4.0f}us | den_sw {t_den_bf*1000:4.0f}->{t_den_f8*1000:4.0f}us | "
-            f"sh_sw {t_sh_bf*1000:3.0f}->{t_sh_f8*1000:3.0f}us | lm_head={t_lh*1000:4.0f}us",
+            f"  B={B:2d}: qkv5={t_qkv_f8*1000:4.0f}us ({gb_s:5.1f}GB/s, x63={t_qkv_f8*63:4.1f}ms) "
+            f"qkvb={t_qkvb*1000:4.0f}us mrg={t_qkv_m*1000:4.0f}us | "
+            f"op={t_op_f8*1000:3.0f}us(pss={t_op_pss*1000:3.0f}) | denSw={t_den_f8*1000:3.0f}us | "
+            f"rtr+shSw={t_rtr*1000:2.0f}+{t_sh_f8*1000:2.0f}->fus={t_rtr_se*1000:2.0f}us | lm_head={t_lh*1000:4.0f}us",
             flush=True,
         )
 
@@ -370,6 +480,7 @@ def main():
     if not a.skip_exact:
         ok &= test_weights_and_prefill(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8)
         ok &= test_gemv_exactness(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head)
+        ok &= test_part_ss_and_repack(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8)
     if ok:
         bench_and_tune(l0_bf, l0_fp8, l4_bf, l4_fp8, l7_bf, l7_fp8, lm_head)
     print("\nSUMMARY:", "ALL PASS" if ok else "FAIL", flush=True)
