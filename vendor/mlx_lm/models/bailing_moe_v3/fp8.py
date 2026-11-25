@@ -7,7 +7,7 @@ from mlx import nn
 
 from mlx_lm.layers.attention import MultiLinear
 
-from .rows.gemv_fp8 import dequant_fp8_multilinear_to_bf16, dequant_fp8_to_bf16
+from .rows.gemv_fp8 import dequant_fp8_multilinear_to_bf16, dequant_fp8_to_bf16, gemv_fp8_rows
 
 
 class FP8BlockLinear(nn.Module):
@@ -25,6 +25,15 @@ class FP8BlockLinear(nn.Module):
         return dequant_fp8_to_bf16(self.weight_fp8, self.weight_scale_inv)
 
     def __call__(self, x: mx.array) -> mx.array:
+        if (
+            x.dtype == mx.bfloat16
+            and self.weight_fp8.shape[1] % 128 == 0
+            and self.weight_fp8.shape[0] % 4 == 0
+        ):
+            if x.ndim == 2 and x.shape[0] == 1:
+                return gemv_fp8_rows(x, self.weight_fp8, self.weight_scale_inv)
+            if x.ndim == 3 and x.shape[0] == 1 and x.shape[1] == 1:
+                return gemv_fp8_rows(x[0], self.weight_fp8, self.weight_scale_inv)[None]
         w = dequant_fp8_to_bf16(self.weight_fp8, self.weight_scale_inv)
         if x.dtype != w.dtype:
             w = w.astype(x.dtype)
@@ -47,6 +56,20 @@ class FP8MultiLinear(nn.Module):
         )
 
     def __call__(self, x: mx.array, transpose: bool = True) -> mx.array:
+        if (
+            transpose
+            and x.dtype == mx.bfloat16
+            and x.ndim == 4
+            and 1 <= x.shape[0] <= 24
+            and x.shape[2] == 1
+            and self.weight_fp8.shape[2] % 128 == 0
+            and self.weight_fp8.shape[1] % 8 == 0
+        ):
+            from .rows.mla import mla_multilinear_fp8_rows
+
+            return mla_multilinear_fp8_rows(
+                x, self.weight_fp8, self.weight_scale_inv, scale_by_n=self.scale_by_n
+            )
         w = dequant_fp8_multilinear_to_bf16(
             self.weight_fp8, self.weight_scale_inv, self.scale_by_n
         )

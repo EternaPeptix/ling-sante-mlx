@@ -11,6 +11,8 @@ from .rows.mla import mla_layer_rows
 from .rows.moe import moe_down_combine_rows, moe_gate_up_swiglu_rows
 from .rows.router import gate_rows
 
+_FAST_FLUSH_EVERY = int(os.environ.get("LINGSANTE_FAST_FLUSH", "4"))
+
 
 def can_fast_decode(model, inputs, cache) -> bool:
     if os.environ.get("LINGSANTE_FAST_DECODE", "1") in ("0", ""):
@@ -67,7 +69,7 @@ def fast_decode_forward(model, inputs, cache):
     inner = model.model
     x = inner.word_embeddings(inputs)[:, 0, :]
 
-    for layer, c in zip(inner.layers, cache):
+    for li, (layer, c) in enumerate(zip(inner.layers, cache)):
         h_in = mx.fast.rms_norm(x, layer.input_layernorm.weight, layer.input_layernorm.eps)
         if layer.is_linear:
             attn = layer.attention
@@ -163,6 +165,9 @@ def fast_decode_forward(model, inputs, cache):
         else:
             mid = gemv_lin_swiglu(mlp_in, mlp.gate_proj, mlp.up_proj)
             x = gemv_lin_res(mid, mlp.down_proj, h_post)
+
+        if _FAST_FLUSH_EVERY > 0 and (li + 1) % _FAST_FLUSH_EVERY == 0:
+            mx.async_eval(x)
 
     x = mx.fast.rms_norm(x, inner.norm.weight, inner.norm.eps)
     return gemv_lin(x, model.lm_head)[:, None, :]
